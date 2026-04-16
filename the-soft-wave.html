@@ -1457,7 +1457,10 @@
       <hr style="border:none;border-top:1px solid var(--border);margin:1.25rem 0;">
 
       <div class="modal-step-label" style="margin-bottom:0.5rem;">Step 2 — Artist pool &nbsp;<span id="artist-pool-count" style="color:var(--muted);font-size:0.5rem;letter-spacing:0.1em;"></span></div>
-      <div style="display:flex;gap:0.4rem;margin-bottom:0.6rem;flex-wrap:wrap;align-items:center;">
+      <div id="artistPoolLockedNotice" style="display:none;font-size:0.57rem;color:var(--gold);letter-spacing:0.06em;margin-bottom:0.6rem;padding:0.45rem 0.7rem;border:1px solid rgba(201,169,127,0.3);border-radius:2px;">
+        ✦ Using your selected artists — playlist will only include these artists
+      </div>
+      <div style="display:flex;gap:0.4rem;margin-bottom:0.6rem;flex-wrap:wrap;align-items:center;" id="artistPoolControls">
         <button class="btn" style="font-size:0.52rem;padding:0.28rem 0.6rem;" onclick="resetArtistPool()">All artists</button>
         <button class="btn" style="font-size:0.52rem;padding:0.28rem 0.6rem;" onclick="clearArtistPool()">Pick specific</button>
         <button class="btn" style="font-size:0.52rem;padding:0.28rem 0.6rem;" id="suggestArtistsBtn" onclick="suggestArtistsForMood()">✦ Suggest for mood</button>
@@ -2337,6 +2340,16 @@ function openPlaylistModal(preselectedIds) {
   document.getElementById('playlistModal').classList.add('open');
   if (preselectedIds) selectedArtistIds = preselectedIds;
   initArtistPool();
+  // Show locked notice and hide pool controls when artists are preselected from grid
+  const locked = preselectedIds && preselectedIds.length > 0;
+  const notice = document.getElementById('artistPoolLockedNotice');
+  const controls = document.getElementById('artistPoolControls');
+  if (notice) notice.style.display = locked ? '' : 'none';
+  if (controls) controls.style.display = locked ? 'none' : '';
+  if (locked) {
+    const names = preselectedIds.map(id => ARTISTS.find(a => a.id === id)?.name).filter(Boolean).join(', ');
+    if (notice) notice.textContent = `✦ ${preselectedIds.length} artist${preselectedIds.length > 1 ? 's' : ''} selected: ${names}`;
+  }
 }
 
 function closePlaylistModal() {
@@ -2386,12 +2399,14 @@ async function generatePlaylist() {
 
 Create a playlist with exactly ${selectedLength} tracks for this mood: "${mood}"
 
-AVAILABLE ARTIST POOL:
+ARTIST POOL (you MUST only use these ${artistPool.length} artists — do NOT add any other artists under any circumstances):
 ${artistContext}
 
 Rules:
-- Only use artists from the pool above
-- Use real, actual tracks (use their listed starter tracks or other well-known tracks by them)
+- ONLY use artists listed above. Using any artist not in the list above is a critical error.
+- Spread tracks across the artists in the pool — do not repeat the same artist back-to-back
+- Pick the tracks that best fit the mood from each artist — use their listed starter tracks or other real well-known tracks
+- The order of tracks should flow naturally for the mood, not follow any particular artist order
 - The playlist should have a poetic, evocative title (examples: "For 3am when the city's quiet", "Soft rain on a Saturday you forgot about", "The kind of love that doesn't ask questions")
 - Each track should have a one-sentence reason written in second person, present tense, poetic and evocative
 
