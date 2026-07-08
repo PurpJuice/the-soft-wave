@@ -1444,7 +1444,7 @@
     <div class="logo">The Soft Wave <span>·</span></div>
   </div>
   <div class="header-actions">
-    <button id="adminRoleBadge" class="chat-quick-btn" onclick="openLearnedPatternPanel()" style="display:none;font-size:0.5rem;color:var(--gold);font-family:'DM Mono',monospace;letter-spacing:0.1em;text-transform:uppercase;border-color:rgba(201,169,127,0.35);padding:0.22rem 0.5rem;border-radius:2px;" title="Open admin diagnostics">Admin</button>
+    <button id="adminRoleBadge" class="chat-quick-btn" onclick="openAdminBadgePanel()" style="display:none;font-size:0.5rem;color:var(--gold);font-family:'DM Mono',monospace;letter-spacing:0.1em;text-transform:uppercase;border-color:rgba(201,169,127,0.35);padding:0.22rem 0.5rem;border-radius:2px;cursor:pointer;" title="Open admin diagnostics">Admin</button>
     <button class="select-mode-toggle" id="selectModeToggle" onclick="toggleSelectMode()" title="Select artists">Select</button>
     <button class="btn btn-gold" onclick="openPlaylistModal()">
       <span>Generate Playlist</span>
@@ -2118,6 +2118,25 @@ function openLearnedPatternPanel() {
   }
   renderLearnedPatternPanel();
   document.getElementById('learnedPatternModal').classList.add('open');
+}
+
+async function openAdminBadgePanel() {
+  try {
+    const { data: { session } } = await _supabase.auth.getSession();
+    const email = String(session?.user?.email || '').toLowerCase().trim();
+    const allowed = currentUserIsAdmin || OWNER_ADMIN_EMAILS.has(email);
+    if (!allowed) {
+      showTooltip('Admin access required');
+      return;
+    }
+    currentUserIsAdmin = true;
+    updateAdminOnlyUI();
+    renderLearnedPatternPanel();
+    document.getElementById('learnedPatternModal').classList.add('open');
+  } catch (e) {
+    // Fallback to existing guard path.
+    openLearnedPatternPanel();
+  }
 }
 
 function closeLearnedPatternPanel() {
