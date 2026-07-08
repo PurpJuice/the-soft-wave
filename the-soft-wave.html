@@ -4460,6 +4460,32 @@ function spotifyQ(str) {
   return encodeURIComponent(str.replace(/[()[\]]/g, '').replace(/\s+/g, ' ').trim());
 }
 
+/**
+ * Try to open the native Spotify / Apple Music app first.
+ * If the app is not installed (window never loses focus within ~850ms),
+ * fall back to opening the web URL in a new tab.
+ * @param {string} appUri  - custom URI scheme  e.g. spotify:search:... or music://...
+ * @param {string} webUrl  - https:// fallback URL
+ * @param {Event}  [evt]   - originating click event (will be preventDefault-ed)
+ */
+function openMusicLink(appUri, webUrl, evt) {
+  if (evt) evt.preventDefault();
+  let appOpened = false;
+  const onBlur = () => { appOpened = true; };
+  window.addEventListener('blur', onBlur, { once: true });
+  // Launch via hidden anchor — avoids navigating the current page
+  const tmp = document.createElement('a');
+  tmp.href = appUri;
+  tmp.style.display = 'none';
+  document.body.appendChild(tmp);
+  try { tmp.click(); } catch(_) {}
+  document.body.removeChild(tmp);
+  setTimeout(() => {
+    window.removeEventListener('blur', onBlur);
+    if (!appOpened) window.open(webUrl, '_blank', 'noopener,noreferrer');
+  }, 850);
+}
+
 function isKnownTrackForArtist(artistName, trackName) {
   const a = ARTISTS.find(x => normText(x.name) === normText(artistName));
   if (!a) return false;
@@ -4468,11 +4494,20 @@ function isKnownTrackForArtist(artistName, trackName) {
 }
 
 function trackSearchLinks(artistName, trackName) {
-  const strictSpotify = `artist:"${String(artistName || '').trim()}" track:"${String(trackName || '').trim()}"`;
-  const strictApple = `${String(artistName || '').trim()} ${String(trackName || '').trim()}`;
+  const artist = String(artistName || '').trim();
+  const track  = String(trackName  || '').trim();
+  const strictSpotify = `artist:"${artist}" track:"${track}"`;
+  const strictApple   = `${artist} ${track}`;
+  const webSpotify = `https://open.spotify.com/search/${encodeURIComponent(strictSpotify)}`;
+  const webApple   = `https://music.apple.com/search?term=${encodeURIComponent(strictApple)}`;
+  // Native app URIs — browsers try to open the installed app; JS fallback handles the miss
+  const appSpotify = `spotify:search:${encodeURIComponent(strictSpotify)}`;
+  const appApple   = `music://music.apple.com/search?term=${encodeURIComponent(strictApple)}`;
   return {
-    spotifyUrl: `https://open.spotify.com/search/${encodeURIComponent(strictSpotify)}`,
-    appleUrl: `https://music.apple.com/search?term=${encodeURIComponent(strictApple)}`,
+    spotifyUrl:    webSpotify,
+    appleUrl:      webApple,
+    spotifyAppUri: appSpotify,
+    appleAppUri:   appApple,
     verified: isKnownTrackForArtist(artistName, trackName)
   };
 }
@@ -5506,6 +5541,29 @@ Only include real, actual tracks that this artist has released. If unsure, use t
 // Show API key modal on load (don't render grid until key is set)
 // renderAll() is called after key is entered
 document.addEventListener('click', (evt) => {
+  // ── App-first music link opening ─────────────────────────
+  const musicLink = evt.target.closest('.ai-track-link, .track-spotify');
+  if (musicLink) {
+    const webUrl = String(musicLink.getAttribute('href') || '');
+    if (!webUrl.startsWith('http')) return; // already a custom URI — skip
+    let appUri = null;
+    if (webUrl.includes('open.spotify.com/search/')) {
+      // Extract the encoded query and reuse it as spotify:search: URI
+      const encoded = webUrl.replace('https://open.spotify.com/search/', '');
+      appUri = `spotify:search:${encoded}`;
+    } else if (webUrl.includes('music.apple.com/search')) {
+      try {
+        const term = new URL(webUrl).searchParams.get('term') || '';
+        appUri = `music://music.apple.com/search?term=${encodeURIComponent(term)}`;
+      } catch(_) {}
+    }
+    if (appUri) {
+      openMusicLink(appUri, webUrl, evt);
+    }
+    // Fall through so analytics handler below can also fire
+  }
+
+  // ── Analytics tracking ───────────────────────────────────
   const link = evt.target.closest('.rec-track-link');
   if (!link) return;
   const artist = link.getAttribute('data-artist') || '';
