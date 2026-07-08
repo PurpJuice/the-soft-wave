@@ -2195,6 +2195,7 @@ saveUserProfile();
 // ============================================================
 
 const RECO_STORAGE_KEY = 'tsw_reco_profile_v1';
+const MISMATCH_STORAGE_KEY = 'tsw_mismatch_reports_v1';
 const RECO_SESSION_ID = (window.crypto && crypto.randomUUID)
   ? crypto.randomUUID()
   : `sess_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
@@ -2202,6 +2203,7 @@ let canWriteRecoEvents = true;
 let canWriteTrackRatings = true;
 let canWriteModelConfig = true;
 let canWriteQualityMetrics = true;
+let canWriteMismatchReports = true;
 
 const DEFAULT_RECO_MODEL = {
   version: 'local-default-v2',
@@ -2248,6 +2250,23 @@ const sessionQuality = {
 
 let activePlaylistSession = null;
 let qualityFlushTimerId = null;
+
+function loadMismatchReportState() {
+  try {
+    const raw = localStorage.getItem(MISMATCH_STORAGE_KEY);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === 'object' ? parsed : {};
+  } catch (e) {
+    return {};
+  }
+}
+
+function saveMismatchReportState() {
+  try { localStorage.setItem(MISMATCH_STORAGE_KEY, JSON.stringify(mismatchReportState)); } catch (e) {}
+}
+
+let mismatchReportState = loadMismatchReportState();
 
 function loadRecoProfile() {
   try {
@@ -2640,6 +2659,93 @@ function makeTrackKey(artistName, trackName) {
   return `${normText(artistName)}::${normText(trackName)}`;
 }
 
+function isTrackBlockedByMismatch(artistName, trackName) {
+  const key = makeTrackKey(artistName, trackName);
+  const rec = mismatchReportState[key];
+  return !!(rec && Number(rec.count || 0) >= 1);
+}
+
+function noteMismatchBlock(artistName, trackName, reason, expectedArtist = '', expectedTrack = '') {
+  const key = makeTrackKey(artistName, trackName);
+  const prev = mismatchReportState[key] || { count: 0, reasons: [], expected: [], updated_at: null };
+  const reasons = Array.isArray(prev.reasons) ? prev.reasons.slice(0, 8) : [];
+  const expected = Array.isArray(prev.expected) ? prev.expected.slice(0, 8) : [];
+  if (reason) reasons.unshift(String(reason).slice(0, 240));
+  if (expectedArtist || expectedTrack) {
+    expected.unshift({
+      artist: String(expectedArtist || '').slice(0, 120),
+      track: String(expectedTrack || '').slice(0, 160)
+    });
+  }
+  mismatchReportState[key] = {
+    count: Number(prev.count || 0) + 1,
+    reasons: reasons.slice(0, 8),
+    expected: expected.slice(0, 8),
+    updated_at: new Date().toISOString()
+  };
+  saveMismatchReportState();
+}
+
+async function loadGlobalMismatchReports() {
+  if (!canWriteMismatchReports) return;
+  try {
+    const { data: { session } } = await _supabase.auth.getSession();
+    if (!session) return;
+    const cursor = mismatchReportState.__remoteCursor || null;
+    let query = _supabase
+      .from('track_mismatch_reports')
+      .select('artist_name,track_name,reason,expected_artist_name,expected_track_name,created_at')
+      .order('created_at', { ascending: true })
+      .limit(4000);
+    if (cursor) query = query.gt('created_at', cursor);
+    const { data, error } = await query;
+
+    if (error) {
+      if (/track_mismatch_reports/i.test(error.message || '')) {
+        canWriteMismatchReports = false;
+      }
+      return;
+    }
+
+    let latest = cursor;
+    for (const row of (data || [])) {
+      noteMismatchBlock(
+        row.artist_name,
+        row.track_name,
+        row.reason || '',
+        row.expected_artist_name || '',
+        row.expected_track_name || ''
+      );
+      if (!latest || String(row.created_at || '') > latest) latest = String(row.created_at || '');
+    }
+    if (latest) {
+      mismatchReportState.__remoteCursor = latest;
+      saveMismatchReportState();
+    }
+  } catch (e) {}
+}
+
+async function submitGlobalMismatchReport(artistName, trackName, source, reason, expectedArtist, expectedTrack) {
+  if (!canWriteMismatchReports) return;
+  try {
+    const { data: { session } } = await _supabase.auth.getSession();
+    if (!session) return;
+    const row = {
+      reporter_user_id: session.user.id,
+      artist_name: artistName,
+      track_name: trackName,
+      source: source || null,
+      reason: reason || null,
+      expected_artist_name: expectedArtist || null,
+      expected_track_name: expectedTrack || null
+    };
+    const { error } = await _supabase.from('track_mismatch_reports').insert(row);
+    if (error && /track_mismatch_reports/i.test(error.message || '')) {
+      canWriteMismatchReports = false;
+    }
+  } catch (e) {}
+}
+
 function inferArtistIdByName(artistName) {
   const name = normText(artistName);
   const a = ARTISTS.find(x => normText(x.name) === name);
@@ -2691,6 +2797,7 @@ function buildRecommendationCandidates(artistPool, mood, wanted = 40, context = 
       : 0;
 
     for (const track of artist.tracks) {
+      if (isTrackBlockedByMismatch(artist.name, track)) continue;
       const key = makeTrackKey(artist.name, track);
       if (seen.has(key)) continue;
       seen.add(key);
@@ -2951,19 +3058,48 @@ function renderTrackRatingWidget(artistName, trackName, source = 'track') {
 }
 
 function renderTrackMismatchButton(artistName, trackName, source = 'track') {
-  return `<button class="track-rate-btn" title="This link/song match looks wrong" onclick="reportWrongMatch('${escapeJsSq(artistName)}','${escapeJsSq(trackName)}','${escapeJsSq(source)}')">wrong match</button>`;
+  return `<button class="track-rate-btn" title="Report incorrect artist-track match" onclick="reportWrongMatch('${escapeJsSq(artistName)}','${escapeJsSq(trackName)}','${escapeJsSq(source)}')">report mismatch</button>`;
 }
 
-function reportWrongMatch(artistName, trackName, source = 'track') {
+async function reportWrongMatch(artistName, trackName, source = 'track') {
+  const reason = prompt(
+    `Tell us what was wrong with this match for ${artistName} - ${trackName}:\n` +
+    `Examples: \n- song is by a different artist\n- wrong version/remix\n- this track does not exist for this artist\n- mood mismatch`,
+    'song is by a different artist'
+  );
+  if (reason == null) return;
+
+  const expectedArtist = prompt('Optional: what should the artist be? (leave blank if unknown)', '');
+  if (expectedArtist == null) return;
+  const expectedTrack = prompt('Optional: what should the track title be? (leave blank if unknown)', '');
+  if (expectedTrack == null) return;
+
+  noteMismatchBlock(artistName, trackName, reason, expectedArtist, expectedTrack);
+
   const artistId = inferArtistIdByName(artistName);
   recordRecoEvent('track_mismatch', {
     artist_id: artistId,
     artist_name: artistName,
     track_name: trackName,
     source,
-    metadata: { reason: 'user_marked_wrong_match' }
+    metadata: {
+      reason: 'user_marked_wrong_match',
+      user_reason: String(reason || '').slice(0, 240),
+      expected_artist_name: String(expectedArtist || '').slice(0, 120),
+      expected_track_name: String(expectedTrack || '').slice(0, 160)
+    }
   });
-  showTooltip('Thanks - we will avoid this mismatch');
+
+  await submitGlobalMismatchReport(
+    artistName,
+    trackName,
+    source,
+    String(reason || '').slice(0, 240),
+    String(expectedArtist || '').slice(0, 120),
+    String(expectedTrack || '').slice(0, 160)
+  );
+
+  showTooltip('Mismatch saved. We will block this for future users.');
 }
 
 function refreshTrackRatingWidgets(artistName, trackName) {
@@ -3499,7 +3635,7 @@ function openDetail(artistId) {
     const spotifyUrl = links.spotifyUrl;
     const appleMusicUrl = links.appleUrl;
     const verifyNote = links.verified ? '' : `<span style="font-size:0.5rem;color:var(--muted);letter-spacing:0.06em;">unverified match</span>`;
-    const mismatchBtn = links.verified ? '' : renderTrackMismatchButton(artist.name, t, 'artist_detail');
+    const mismatchBtn = renderTrackMismatchButton(artist.name, t, 'artist_detail');
     return `<div class="track-item" style="padding:0.6rem 0;border-bottom:1px solid var(--border);">
       <div style="display:flex;align-items:center;gap:0.75rem;">
       <span class="track-num">0${i+1}</span>
@@ -3585,6 +3721,7 @@ Based on the following artist pool, find 5 tracks that match this sonic referenc
 
 ARTIST POOL:
 ${allArtistContext}
+${buildMismatchAvoidancePrompt()}
 
 Return EXACTLY this JSON format and nothing else:
 {
@@ -3610,6 +3747,7 @@ Return EXACTLY this JSON format and nothing else:
     }
     const clean = text.replace(/```json|```/g, '').trim();
     const data = JSON.parse(clean);
+    data.tracks = sanitizeAiTrackList(data.tracks || []);
     renderAiTracks(data.tracks, 'soundsLikeResults', true);
   } catch(e) {
     resultsDiv.innerHTML = `<div class="error-msg">Couldn't find matches: ${e.message}. Check your API key.</div>`;
@@ -3957,9 +4095,11 @@ Rules:
 - The order of tracks should flow naturally for the mood, not follow any particular artist order
 - The playlist should have a poetic, evocative title (examples: "For 3am when the city's quiet", "Soft rain on a Saturday you forgot about", "The kind of love that doesn't ask questions")
 - Each track should have a one-sentence reason written in second person, present tense, poetic and evocative
+- If an artist-track pair has been previously reported as a mismatch, never output that pair.
 
 CANDIDATE TRACKS (pick from these only):
 ${candidateContext}
+${buildMismatchAvoidancePrompt()}
 
 Return EXACTLY this JSON format and nothing else:
 {
@@ -3990,6 +4130,7 @@ Return EXACTLY this JSON format and nothing else:
     if (text) {
       const clean = text.replace(/```json|```/g, '').trim();
       const data = JSON.parse(clean);
+      data.tracks = sanitizeAiTrackList(data.tracks || []);
       const used = new Set();
       data.tracks = (data.tracks || []).filter(t => {
         if (!t || !t.artist || !t.track) return false;
@@ -4065,7 +4206,7 @@ function renderPlaylistOutput(data, mood) {
     const spotifyUrl = links.spotifyUrl;
     const appleMusicUrl = links.appleUrl;
     const verifyNote = links.verified ? '' : `<div style="font-size:0.5rem;color:var(--muted);letter-spacing:0.06em;margin-top:0.2rem;">unverified match</div>`;
-    const mismatchBtn = links.verified ? '' : renderTrackMismatchButton(t.artist, t.track, 'playlist_output');
+    const mismatchBtn = renderTrackMismatchButton(t.artist, t.track, 'playlist_output');
     const artistObj = ARTISTS.find(a => a.name.toLowerCase() === t.artist.toLowerCase());
     const artistLink = artistObj
       ? `<span style="cursor:pointer;color:var(--gold);text-decoration:underline;text-underline-offset:3px;" onclick="closePlaylistOutput();openDetail('${artistObj.id}')">${t.artist}</span>`
@@ -4356,7 +4497,7 @@ function renderPlaylistEditor(id) {
     const spotifyUrl = links.spotifyUrl;
     const appleUrl = links.appleUrl;
     const verifyNote = links.verified ? '' : `<div style="font-size:0.5rem;color:var(--muted);letter-spacing:0.06em;margin-top:0.2rem;">unverified match</div>`;
-    const mismatchBtn = links.verified ? '' : renderTrackMismatchButton(t.artist, t.track, 'saved_playlist_editor');
+    const mismatchBtn = renderTrackMismatchButton(t.artist, t.track, 'saved_playlist_editor');
     return `<div class="editable-track" id="track-row-${id}-${i}">
       <button class="track-remove-btn" onclick="removeTrackFromSaved('${id}',${i})" title="Remove">✕</button>
       <div style="flex:1;">
@@ -4512,6 +4653,61 @@ function trackSearchLinks(artistName, trackName) {
   };
 }
 
+function chooseSafeTrackForArtist(artistName, preferredTrack = '') {
+  const artist = ARTISTS.find(a => normText(a.name) === normText(artistName));
+  if (!artist || !Array.isArray(artist.tracks)) return preferredTrack || '';
+  for (const t of artist.tracks) {
+    if (isTrackBlockedByMismatch(artist.name, t)) continue;
+    return t;
+  }
+  return preferredTrack || artist.tracks[0] || '';
+}
+
+function sanitizeAiTrackList(tracks) {
+  const out = [];
+  const used = new Set();
+  for (const raw of (tracks || [])) {
+    if (!raw || !raw.artist || !raw.track) continue;
+    let artist = String(raw.artist).trim();
+    let track = String(raw.track).trim();
+    const reason = String(raw.reason || '').trim();
+
+    const knownArtist = ARTISTS.find(a => normText(a.name) === normText(artist));
+    if (knownArtist) {
+      artist = knownArtist.name;
+      const exact = knownArtist.tracks.find(t => normText(t) === normText(track));
+      track = exact || chooseSafeTrackForArtist(knownArtist.name, knownArtist.tracks[0] || track);
+    }
+
+    if (isTrackBlockedByMismatch(artist, track)) {
+      track = chooseSafeTrackForArtist(artist, track);
+    }
+
+    if (!artist || !track) continue;
+    const key = makeTrackKey(artist, track);
+    if (used.has(key)) continue;
+    used.add(key);
+    out.push({ artist, track, reason });
+  }
+  return out;
+}
+
+function buildMismatchAvoidancePrompt(limit = 28) {
+  const lines = Object.entries(mismatchReportState || {})
+    .filter(([k, v]) => !k.startsWith('__') && Number(v?.count || 0) >= 1)
+    .sort((a, b) => Number(b[1].count || 0) - Number(a[1].count || 0))
+    .slice(0, limit)
+    .map(([k]) => {
+      const parts = k.split('::');
+      if (parts.length < 2) return null;
+      return `${parts[0]} - ${parts[1]}`;
+    })
+    .filter(Boolean);
+
+  if (!lines.length) return '';
+  return `\nDo NOT recommend these previously reported bad artist-track matches:\n${lines.map((l, i) => `${i + 1}. ${l}`).join('\n')}`;
+}
+
 function escapeHtml(str) {
   return String(str || '')
     .replace(/&/g, '&amp;')
@@ -4554,9 +4750,11 @@ function parseChatRecommendations(text) {
     if (knownArtist) {
       artist = knownArtist.name;
       const exact = knownArtist.tracks.find(t => normText(t) === normText(track));
-      if (exact) {
-        track = exact;
-      }
+      track = exact || chooseSafeTrackForArtist(knownArtist.name, knownArtist.tracks[0] || track);
+    }
+
+    if (isTrackBlockedByMismatch(artist, track)) {
+      track = chooseSafeTrackForArtist(artist, track);
     }
 
     picks.push({ index: idx, artist, track, reason });
@@ -4574,6 +4772,7 @@ function renderChatRecommendationCards(text, source = 'discovery_chat') {
     const whyId = `chat-why-${Date.now()}-${i}`;
     const whyText = p.reason || 'This pick was selected for your described mood and emotional texture.';
     const verifyNote = links.verified ? '' : `<div style="font-size:0.5rem;color:var(--muted);letter-spacing:0.06em;margin-top:0.2rem;">unverified match</div>`;
+    const mismatchBtn = renderTrackMismatchButton(p.artist, p.track, source);
     return `<div class="ai-track-card fade-in" style="animation-delay:${i * 0.04}s;margin-top:0.45rem;">
       <div class="ai-track-artist">${p.index}. ${escapeHtml(p.artist)}</div>
       <div class="ai-track-name">${escapeHtml(p.track)}</div>
@@ -4584,6 +4783,7 @@ function renderChatRecommendationCards(text, source = 'discovery_chat') {
       <button class="chat-quick-btn" style="margin-top:0.35rem;font-size:0.52rem;" onclick="toggleWhyReason('${whyId}')">Why this fits</button>
       <div id="${whyId}" style="display:none;margin-top:0.35rem;font-size:0.66rem;line-height:1.5;color:rgba(233,229,223,0.82);">${escapeHtml(whyText)}</div>
       ${verifyNote}
+      <div style="margin-top:0.25rem;">${mismatchBtn}</div>
       ${renderTrackRatingWidget(p.artist, p.track, source)}
     </div>`;
   }).join('');
@@ -4601,12 +4801,14 @@ function renderAiTracks(tracks, containerId, withArtistLink = false) {
   const container = document.getElementById(containerId);
   if (!container) return;
 
-  container.innerHTML = `<div class="ai-results">` + tracks.map((t, i) => {
+  const safeTracks = sanitizeAiTrackList(tracks || []);
+
+  container.innerHTML = `<div class="ai-results">` + safeTracks.map((t, i) => {
     const links = trackSearchLinks(t.artist, t.track);
     const spotifyUrl = links.spotifyUrl;
     const appleMusicUrl = links.appleUrl;
     const verifyNote = links.verified ? '' : `<div style="font-size:0.5rem;color:var(--muted);letter-spacing:0.06em;margin-top:0.2rem;">unverified match</div>`;
-    const mismatchBtn = links.verified ? '' : renderTrackMismatchButton(t.artist, t.track, containerId);
+    const mismatchBtn = renderTrackMismatchButton(t.artist, t.track, containerId);
     const artistObj = ARTISTS.find(a => a.name.toLowerCase() === t.artist.toLowerCase());
     const artistDisplay = (withArtistLink && artistObj)
       ? `<span style="cursor:pointer;text-decoration:underline;text-underline-offset:3px;" onclick="openDetail('${artistObj.id}')">${t.artist}</span>`
@@ -5382,6 +5584,7 @@ Personality rules — do NOT break these:
 
 Artist roster:
 ${artistContext}${buildLearnedPatternPrompt()}
+${buildMismatchAvoidancePrompt()}
 
 Music rules:
 - If someone asks for a playlist of N songs, give exactly N tracks — no matter how large. Never cut it short.
@@ -5683,6 +5886,7 @@ _supabase.auth.onAuthStateChange((event, session) => {
     hideAuthOverlay();
     applySharedProxyModeUI();
     loadRecoModelConfig();
+    loadGlobalMismatchReports();
     ensureQualityFlushTimer();
     loadAccountApiKey();
     loadSavedPlaylists();
