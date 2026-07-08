@@ -165,6 +165,23 @@ to authenticated
 with check (auth.uid() = user_id);
 
 -- ============================================================
+-- APP ADMINS (owner-only internal tooling)
+-- ============================================================
+create table if not exists public.app_admins (
+  user_id uuid primary key references auth.users(id) on delete cascade,
+  created_at timestamptz not null default now()
+);
+
+alter table public.app_admins enable row level security;
+
+drop policy if exists app_admins_select_self on public.app_admins;
+create policy app_admins_select_self
+on public.app_admins
+for select
+to authenticated
+using (auth.uid() = user_id);
+
+-- ============================================================
 -- TRACK MISMATCH REPORTS (global correction memory)
 -- ============================================================
 create table if not exists public.track_mismatch_reports (
@@ -186,19 +203,78 @@ create index if not exists track_mismatch_reports_created_at_idx
 
 alter table public.track_mismatch_reports enable row level security;
 
-drop policy if exists track_mismatch_reports_select_all on public.track_mismatch_reports;
-create policy track_mismatch_reports_select_all
+drop policy if exists track_mismatch_reports_select_admin on public.track_mismatch_reports;
+create policy track_mismatch_reports_select_admin
 on public.track_mismatch_reports
+for select
+to authenticated
+using (exists (
+  select 1 from public.app_admins a
+  where a.user_id = auth.uid()
+));
+
+drop policy if exists track_mismatch_reports_insert_admin on public.track_mismatch_reports;
+create policy track_mismatch_reports_insert_admin
+on public.track_mismatch_reports
+for insert
+to authenticated
+with check (
+  auth.uid() = reporter_user_id
+  and exists (
+    select 1 from public.app_admins a
+    where a.user_id = auth.uid()
+  )
+);
+
+-- Public-safe blocklist derived from admin reports.
+-- Regular users can read this to avoid known bad pairs,
+-- but cannot see private report details.
+create table if not exists public.track_mismatch_blocks (
+  artist_name text not null,
+  track_name text not null,
+  report_count integer not null default 1,
+  last_reason text,
+  expected_artist_name text,
+  expected_track_name text,
+  updated_at timestamptz not null default now(),
+  primary key (artist_name, track_name)
+);
+
+create index if not exists track_mismatch_blocks_updated_at_idx
+  on public.track_mismatch_blocks(updated_at desc);
+
+alter table public.track_mismatch_blocks enable row level security;
+
+drop policy if exists track_mismatch_blocks_select_all on public.track_mismatch_blocks;
+create policy track_mismatch_blocks_select_all
+on public.track_mismatch_blocks
 for select
 to authenticated
 using (true);
 
-drop policy if exists track_mismatch_reports_insert_own on public.track_mismatch_reports;
-create policy track_mismatch_reports_insert_own
-on public.track_mismatch_reports
+drop policy if exists track_mismatch_blocks_upsert_admin on public.track_mismatch_blocks;
+create policy track_mismatch_blocks_upsert_admin
+on public.track_mismatch_blocks
 for insert
 to authenticated
-with check (auth.uid() = reporter_user_id);
+with check (exists (
+  select 1 from public.app_admins a
+  where a.user_id = auth.uid()
+));
+
+drop policy if exists track_mismatch_blocks_update_admin on public.track_mismatch_blocks;
+create policy track_mismatch_blocks_update_admin
+on public.track_mismatch_blocks
+for update
+to authenticated
+using (exists (
+  select 1 from public.app_admins a
+  where a.user_id = auth.uid()
+))
+with check (exists (
+  select 1 from public.app_admins a
+  where a.user_id = auth.uid()
+));
 
 -- ============================================================
 -- ACCOUNT API KEYS

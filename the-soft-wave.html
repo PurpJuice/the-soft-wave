@@ -2111,6 +2111,10 @@ function chatFeedbackCorrect(id) {
 }
 
 function openLearnedPatternPanel() {
+  if (!currentUserIsAdmin) {
+    showTooltip('Only admin can view learned diagnostics');
+    return;
+  }
   renderLearnedPatternPanel();
   document.getElementById('learnedPatternModal').classList.add('open');
 }
@@ -2120,6 +2124,7 @@ function closeLearnedPatternPanel() {
 }
 
 function clearLearnedPatterns() {
+  if (!currentUserIsAdmin) return;
   const ok = confirm('Clear all learned mood patterns and examples?');
   if (!ok) return;
   userProfile.patternExamples = [];
@@ -2131,6 +2136,7 @@ function clearLearnedPatterns() {
 }
 
 function removeLearnedExample(index) {
+  if (!currentUserIsAdmin) return;
   if (!Array.isArray(userProfile.patternExamples)) return;
   userProfile.patternExamples.splice(index, 1);
   saveUserProfile();
@@ -2204,6 +2210,8 @@ let canWriteTrackRatings = true;
 let canWriteModelConfig = true;
 let canWriteQualityMetrics = true;
 let canWriteMismatchReports = true;
+let canCheckAdminAccess = true;
+let currentUserIsAdmin = false;
 
 const DEFAULT_RECO_MODEL = {
   version: 'local-default-v2',
@@ -2250,6 +2258,35 @@ const sessionQuality = {
 
 let activePlaylistSession = null;
 let qualityFlushTimerId = null;
+
+function updateAdminOnlyUI() {
+  const learnedBtn = document.getElementById('chatLearnedBtn');
+  if (learnedBtn) learnedBtn.style.display = currentUserIsAdmin ? 'inline-block' : 'none';
+}
+
+async function refreshAdminStatus(session) {
+  currentUserIsAdmin = false;
+  if (!session || !canCheckAdminAccess) {
+    updateAdminOnlyUI();
+    return;
+  }
+  try {
+    const { data, error } = await _supabase
+      .from('app_admins')
+      .select('user_id')
+      .eq('user_id', session.user.id)
+      .limit(1);
+    if (error) {
+      if (/app_admins/i.test(error.message || '')) canCheckAdminAccess = false;
+      updateAdminOnlyUI();
+      return;
+    }
+    currentUserIsAdmin = Array.isArray(data) && data.length > 0;
+  } catch (e) {
+    // Keep non-admin by default on failures.
+  }
+  updateAdminOnlyUI();
+}
 
 function loadMismatchReportState() {
   try {
@@ -2665,7 +2702,7 @@ function isTrackBlockedByMismatch(artistName, trackName) {
   return !!(rec && Number(rec.count || 0) >= 1);
 }
 
-function noteMismatchBlock(artistName, trackName, reason, expectedArtist = '', expectedTrack = '') {
+function noteMismatchBlock(artistName, trackName, reason, expectedArtist = '', expectedTrack = '', absoluteCount = null) {
   const key = makeTrackKey(artistName, trackName);
   const prev = mismatchReportState[key] || { count: 0, reasons: [], expected: [], updated_at: null };
   const reasons = Array.isArray(prev.reasons) ? prev.reasons.slice(0, 8) : [];
@@ -2678,7 +2715,7 @@ function noteMismatchBlock(artistName, trackName, reason, expectedArtist = '', e
     });
   }
   mismatchReportState[key] = {
-    count: Number(prev.count || 0) + 1,
+    count: absoluteCount == null ? Number(prev.count || 0) + 1 : Math.max(1, Number(absoluteCount || 1)),
     reasons: reasons.slice(0, 8),
     expected: expected.slice(0, 8),
     updated_at: new Date().toISOString()
@@ -2686,47 +2723,39 @@ function noteMismatchBlock(artistName, trackName, reason, expectedArtist = '', e
   saveMismatchReportState();
 }
 
-async function loadGlobalMismatchReports() {
+async function loadGlobalMismatchBlocks() {
   if (!canWriteMismatchReports) return;
   try {
     const { data: { session } } = await _supabase.auth.getSession();
     if (!session) return;
-    const cursor = mismatchReportState.__remoteCursor || null;
-    let query = _supabase
-      .from('track_mismatch_reports')
-      .select('artist_name,track_name,reason,expected_artist_name,expected_track_name,created_at')
-      .order('created_at', { ascending: true })
-      .limit(4000);
-    if (cursor) query = query.gt('created_at', cursor);
-    const { data, error } = await query;
+    const { data, error } = await _supabase
+      .from('track_mismatch_blocks')
+      .select('artist_name,track_name,report_count,last_reason,expected_artist_name,expected_track_name,updated_at')
+      .order('updated_at', { ascending: false })
+      .limit(5000);
 
     if (error) {
-      if (/track_mismatch_reports/i.test(error.message || '')) {
+      if (/track_mismatch_blocks|track_mismatch_reports/i.test(error.message || '')) {
         canWriteMismatchReports = false;
       }
       return;
     }
 
-    let latest = cursor;
     for (const row of (data || [])) {
       noteMismatchBlock(
         row.artist_name,
         row.track_name,
-        row.reason || '',
+        row.last_reason || '',
         row.expected_artist_name || '',
-        row.expected_track_name || ''
+        row.expected_track_name || '',
+        Number(row.report_count || 1)
       );
-      if (!latest || String(row.created_at || '') > latest) latest = String(row.created_at || '');
-    }
-    if (latest) {
-      mismatchReportState.__remoteCursor = latest;
-      saveMismatchReportState();
     }
   } catch (e) {}
 }
 
 async function submitGlobalMismatchReport(artistName, trackName, source, reason, expectedArtist, expectedTrack) {
-  if (!canWriteMismatchReports) return;
+  if (!canWriteMismatchReports || !currentUserIsAdmin) return;
   try {
     const { data: { session } } = await _supabase.auth.getSession();
     if (!session) return;
@@ -2739,8 +2768,36 @@ async function submitGlobalMismatchReport(artistName, trackName, source, reason,
       expected_artist_name: expectedArtist || null,
       expected_track_name: expectedTrack || null
     };
-    const { error } = await _supabase.from('track_mismatch_reports').insert(row);
-    if (error && /track_mismatch_reports/i.test(error.message || '')) {
+    const ins = await _supabase.from('track_mismatch_reports').insert(row);
+    if (ins.error && /track_mismatch_reports/i.test(ins.error.message || '')) {
+      canWriteMismatchReports = false;
+      return;
+    }
+
+    const { data: existing, error: readErr } = await _supabase
+      .from('track_mismatch_blocks')
+      .select('report_count')
+      .eq('artist_name', artistName)
+      .eq('track_name', trackName)
+      .limit(1);
+    if (readErr && /track_mismatch_blocks/i.test(readErr.message || '')) {
+      canWriteMismatchReports = false;
+      return;
+    }
+    const nextCount = Number((existing && existing[0]?.report_count) || 0) + 1;
+    const blockRow = {
+      artist_name: artistName,
+      track_name: trackName,
+      report_count: nextCount,
+      last_reason: reason || null,
+      expected_artist_name: expectedArtist || null,
+      expected_track_name: expectedTrack || null,
+      updated_at: new Date().toISOString()
+    };
+    const up = await _supabase
+      .from('track_mismatch_blocks')
+      .upsert(blockRow, { onConflict: 'artist_name,track_name' });
+    if (up.error && /track_mismatch_blocks/i.test(up.error.message || '')) {
       canWriteMismatchReports = false;
     }
   } catch (e) {}
@@ -3058,10 +3115,12 @@ function renderTrackRatingWidget(artistName, trackName, source = 'track') {
 }
 
 function renderTrackMismatchButton(artistName, trackName, source = 'track') {
+  if (!currentUserIsAdmin) return '';
   return `<button class="track-rate-btn" title="Report incorrect artist-track match" onclick="reportWrongMatch('${escapeJsSq(artistName)}','${escapeJsSq(trackName)}','${escapeJsSq(source)}')">report mismatch</button>`;
 }
 
 async function reportWrongMatch(artistName, trackName, source = 'track') {
+  if (!currentUserIsAdmin) return;
   const reason = prompt(
     `Tell us what was wrong with this match for ${artistName} - ${trackName}:\n` +
     `Examples: \n- song is by a different artist\n- wrong version/remix\n- this track does not exist for this artist\n- mood mismatch`,
@@ -5883,10 +5942,11 @@ async function signOut() {
 _supabase.auth.onAuthStateChange((event, session) => {
   console.log('auth state change:', event, session);
   if (session) {
+    refreshAdminStatus(session);
     hideAuthOverlay();
     applySharedProxyModeUI();
     loadRecoModelConfig();
-    loadGlobalMismatchReports();
+    loadGlobalMismatchBlocks();
     ensureQualityFlushTimer();
     loadAccountApiKey();
     loadSavedPlaylists();
@@ -5913,6 +5973,8 @@ _supabase.auth.onAuthStateChange((event, session) => {
       }
     }
   } else {
+    currentUserIsAdmin = false;
+    updateAdminOnlyUI();
     finalizePlaylistSession('session_ended');
     flushQualityMetrics('session_ended');
     stopQualityFlushTimer();
@@ -5945,6 +6007,7 @@ window.addEventListener('pagehide', () => {
 
 updateSavedCount();
 updateChatDownloadBtn();
+updateAdminOnlyUI();
 
 // Close the mainApp wrapper
 document.getElementById('mainApp').insertAdjacentHTML('beforeend', '');
