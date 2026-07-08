@@ -1444,7 +1444,7 @@
     <div class="logo">The Soft Wave <span>·</span></div>
   </div>
   <div class="header-actions">
-    <button id="adminRoleBadge" class="chat-quick-btn" onclick="openAdminBadgePanel()" style="display:none;font-size:0.5rem;color:var(--gold);font-family:'DM Mono',monospace;letter-spacing:0.1em;text-transform:uppercase;border-color:rgba(201,169,127,0.35);padding:0.22rem 0.5rem;border-radius:2px;cursor:pointer;" title="Open admin diagnostics">Admin</button>
+    <button id="adminRoleBadge" type="button" class="chat-quick-btn" onclick="adminBadgeClickTroubleshoot(event)" style="display:none;font-size:0.5rem;color:var(--gold);font-family:'DM Mono',monospace;letter-spacing:0.1em;text-transform:uppercase;border-color:rgba(201,169,127,0.35);padding:0.22rem 0.5rem;border-radius:2px;cursor:pointer;pointer-events:auto;" title="Open admin diagnostics">Admin</button>
     <button class="select-mode-toggle" id="selectModeToggle" onclick="toggleSelectMode()" title="Select artists">Select</button>
     <button class="btn btn-gold" onclick="openPlaylistModal()">
       <span>Generate Playlist</span>
@@ -2136,6 +2136,50 @@ async function openAdminBadgePanel() {
   } catch (e) {
     // Fallback to existing guard path.
     openLearnedPatternPanel();
+  }
+}
+
+async function adminBadgeClickTroubleshoot(evt) {
+  if (evt) {
+    evt.preventDefault();
+    evt.stopPropagation();
+  }
+
+  try {
+    const { data: { session } } = await _supabase.auth.getSession();
+    const email = String(session?.user?.email || '').toLowerCase().trim();
+    const ownerMatch = OWNER_ADMIN_EMAILS.has(email);
+    const allowed = currentUserIsAdmin || ownerMatch;
+
+    if (!allowed) {
+      alert(
+        `Admin blocked.\n\n` +
+        `signed in: ${session ? 'yes' : 'no'}\n` +
+        `email: ${email || '(none)'}\n` +
+        `owner email match: ${ownerMatch ? 'yes' : 'no'}\n` +
+        `currentUserIsAdmin: ${currentUserIsAdmin ? 'true' : 'false'}\n` +
+        `canCheckAdminAccess: ${canCheckAdminAccess ? 'true' : 'false'}`
+      );
+      return;
+    }
+
+    currentUserIsAdmin = true;
+    updateAdminOnlyUI();
+    renderLearnedPatternPanel();
+
+    const modal = document.getElementById('learnedPatternModal');
+    if (!modal) {
+      alert('Admin modal element not found in DOM.');
+      return;
+    }
+
+    modal.classList.add('open');
+    modal.style.opacity = '1';
+    modal.style.pointerEvents = 'all';
+    document.body.style.overflow = 'hidden';
+    showTooltip('Admin panel opened');
+  } catch (e) {
+    alert(`Admin click failed: ${e instanceof Error ? e.message : 'unknown error'}`);
   }
 }
 
