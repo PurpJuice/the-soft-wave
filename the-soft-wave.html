@@ -2270,13 +2270,17 @@ function updateAdminOnlyUI() {
 
 async function refreshAdminStatus(session) {
   currentUserIsAdmin = false;
-  if (!session || !canCheckAdminAccess) {
+  if (!session) {
     updateAdminOnlyUI();
     return;
   }
   const sessionEmail = String(session?.user?.email || '').toLowerCase().trim();
   if (OWNER_ADMIN_EMAILS.has(sessionEmail)) {
     currentUserIsAdmin = true;
+    updateAdminOnlyUI();
+    return;
+  }
+  if (!canCheckAdminAccess) {
     updateAdminOnlyUI();
     return;
   }
