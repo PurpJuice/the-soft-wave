@@ -2212,6 +2212,10 @@ let canWriteQualityMetrics = true;
 let canWriteMismatchReports = true;
 let canCheckAdminAccess = true;
 let currentUserIsAdmin = false;
+const OWNER_ADMIN_EMAILS = new Set([
+  'deleelebea@gmail.com',
+  'lebea.delmon@gmail.com'
+]);
 
 const DEFAULT_RECO_MODEL = {
   version: 'local-default-v2',
@@ -2267,6 +2271,12 @@ function updateAdminOnlyUI() {
 async function refreshAdminStatus(session) {
   currentUserIsAdmin = false;
   if (!session || !canCheckAdminAccess) {
+    updateAdminOnlyUI();
+    return;
+  }
+  const sessionEmail = String(session?.user?.email || '').toLowerCase().trim();
+  if (OWNER_ADMIN_EMAILS.has(sessionEmail)) {
+    currentUserIsAdmin = true;
     updateAdminOnlyUI();
     return;
   }
