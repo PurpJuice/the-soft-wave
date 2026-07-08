@@ -1,0 +1,4 @@
+project_id = "the-soft-wave"
+
+[functions.ai-proxy]
+verify_jwt = true

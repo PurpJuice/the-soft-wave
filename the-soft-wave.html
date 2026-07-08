@@ -524,6 +524,54 @@
 
   .ai-track-link:hover { color: var(--green); border-color: var(--green); }
 
+  .track-rating-wrap {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 0.6rem;
+    margin-top: 0.45rem;
+    padding-top: 0.35rem;
+    border-top: 1px dashed rgba(233,229,223,0.08);
+  }
+
+  .track-rating-meta {
+    font-size: 0.52rem;
+    letter-spacing: 0.08em;
+    color: var(--muted);
+    white-space: nowrap;
+  }
+
+  .track-rating-buttons {
+    display: inline-flex;
+    gap: 0.2rem;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+  }
+
+  .track-rate-btn {
+    font-family: 'DM Mono', monospace;
+    border: 1px solid var(--border);
+    color: var(--muted);
+    background: rgba(255,255,255,0.02);
+    border-radius: 2px;
+    font-size: 0.5rem;
+    line-height: 1;
+    padding: 0.16rem 0.3rem;
+    cursor: pointer;
+    transition: all 0.16s;
+  }
+
+  .track-rate-btn:hover {
+    color: var(--text);
+    border-color: rgba(233,229,223,0.25);
+  }
+
+  .track-rate-btn.active {
+    color: var(--gold);
+    border-color: rgba(201,169,127,0.45);
+    background: rgba(201,169,127,0.1);
+  }
+
   .loading-pulse {
     font-size: 0.65rem;
     color: var(--muted);
@@ -1453,6 +1501,13 @@
         <button class="mood-preset-btn" onclick="selectPreset(this,'Introspective & Quiet')">Introspective & Quiet</button>
       </div>
       <input type="text" class="custom-mood-input" id="customMood" placeholder="Or describe your own mood...">
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:0.45rem;margin-top:0.55rem;">
+        <input type="text" class="custom-mood-input" id="ctxReferenceArtists" placeholder="Like: Frank Ocean, SZA" style="margin-top:0;font-size:0.6rem;padding:0.46rem 0.65rem;">
+        <input type="text" class="custom-mood-input" id="ctxAvoidArtists" placeholder="Avoid: Frank Ocean" style="margin-top:0;font-size:0.6rem;padding:0.46rem 0.65rem;">
+        <input type="text" class="custom-mood-input" id="ctxPlace" placeholder="Place: driving, beach, downtown" style="margin-top:0;font-size:0.6rem;padding:0.46rem 0.65rem;">
+        <input type="text" class="custom-mood-input" id="ctxColor" placeholder="Color/texture: blue, neon, warm" style="margin-top:0;font-size:0.6rem;padding:0.46rem 0.65rem;">
+      </div>
+      <textarea class="custom-mood-input" id="ctxExperience" rows="3" placeholder="Describe an experience: what happened, where you were, what it felt like..." style="margin-top:0.55rem;font-size:0.6rem;padding:0.52rem 0.65rem;resize:vertical;min-height:72px;"></textarea>
 
       <hr style="border:none;border-top:1px solid var(--border);margin:1.25rem 0;">
 
@@ -1677,6 +1732,10 @@ const SECTION_LABELS = {
 let GEMINI_API_KEY = '';
 let OPENROUTER_KEY = '';
 let SELECTED_MODEL = 'google/gemini-2.0-flash-001';
+const USE_SHARED_PROXY = true;
+const SHARED_PROXY_MODEL = 'google/gemini-2.0-flash-001';
+const SHARED_PROXY_FUNCTION = 'ai-proxy';
+let canWriteUserApiKeys = true;
 let currentFilter = 'all';
 let selectMode = false;
 /** @type {Set<string>} */
@@ -1748,6 +1807,922 @@ userProfile.lastVisit = new Date().toISOString();
 saveUserProfile();
 
 // ============================================================
+// HYBRID RECOMMENDER + LEARNING LOOP
+// ============================================================
+
+const RECO_STORAGE_KEY = 'tsw_reco_profile_v1';
+const RECO_SESSION_ID = (window.crypto && crypto.randomUUID)
+  ? crypto.randomUUID()
+  : `sess_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+let canWriteRecoEvents = true;
+let canWriteTrackRatings = true;
+let canWriteModelConfig = true;
+let canWriteQualityMetrics = true;
+
+const DEFAULT_RECO_MODEL = {
+  version: 'local-default-v2',
+  updated_at: null,
+  explorationEpsilon: 0.12,
+  timeDecayHalfLifeDays: 21,
+  maxPerArtistSmall: 2,
+  maxPerArtistMedium: 3,
+  maxPerArtistLarge: 4,
+  weights: {
+    artistInterest: 0.35,
+    artistSignal: 0.28,
+    trackSignal: 0.6,
+    moodScore: 1.3,
+    placeScore: 0.8,
+    colorScore: 0.8,
+    experienceScore: 1.1,
+    referenceScore: 2.4,
+    favoriteBonus: 2.5,
+    repeatedPenalty: 1.25,
+    moodPreference: 0.45,
+    randomJitterMax: 0.18
+  }
+};
+
+let recoModel = JSON.parse(JSON.stringify(DEFAULT_RECO_MODEL));
+
+const sessionQuality = {
+  startedAt: Date.now(),
+  lastFlushAt: null,
+  eventCounts: {},
+  playlistGenerateCount: 0,
+  playlistSaveCount: 0,
+  playlistCompletedCount: 0,
+  playlistAbandonedCount: 0,
+  playlistImpressionCount: 0,
+  trackOpenCount: 0,
+  trackLikeCount: 0,
+  trackSkipCount: 0,
+  trackMismatchCount: 0,
+  ratingCount: 0,
+  ratingSum: 0
+};
+
+let activePlaylistSession = null;
+let qualityFlushTimerId = null;
+
+function loadRecoProfile() {
+  try {
+    const raw = localStorage.getItem(RECO_STORAGE_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      return {
+        artistSignals: parsed.artistSignals || {},
+        trackSignals: parsed.trackSignals || {},
+        moodSignals: parsed.moodSignals || {},
+        recentTrackKeys: Array.isArray(parsed.recentTrackKeys) ? parsed.recentTrackKeys : []
+      };
+    }
+  } catch(e) {}
+  return {
+    artistSignals: {},
+    trackSignals: {},
+    moodSignals: {},
+    recentTrackKeys: []
+  };
+}
+
+function saveRecoProfile() {
+  try { localStorage.setItem(RECO_STORAGE_KEY, JSON.stringify(recoProfile)); } catch(e) {}
+}
+
+let recoProfile = loadRecoProfile();
+
+function clampNumber(n, minVal, maxVal) {
+  return Math.max(minVal, Math.min(maxVal, n));
+}
+
+function toNumberOr(fallback, value) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+function decayFactor(lastUpdatedIso, halfLifeDays) {
+  const halfLife = Math.max(1, toNumberOr(DEFAULT_RECO_MODEL.timeDecayHalfLifeDays, halfLifeDays));
+  if (!lastUpdatedIso) return 1;
+  const ts = Date.parse(lastUpdatedIso);
+  if (!Number.isFinite(ts)) return 1;
+  const ageDays = Math.max(0, (Date.now() - ts) / 86400000);
+  return Math.pow(0.5, ageDays / halfLife);
+}
+
+function readDecayedSignal(signalMap, key, halfLifeDays) {
+  if (!signalMap || !key) return 0;
+  const raw = signalMap[key];
+  if (raw == null) return 0;
+  if (typeof raw === 'number') return raw;
+  if (typeof raw === 'object') {
+    const base = toNumberOr(0, raw.value);
+    return base * decayFactor(raw.last_updated || raw.updated_at || null, halfLifeDays);
+  }
+  return 0;
+}
+
+function writeSignal(signalMap, key, delta, minVal, maxVal) {
+  if (!signalMap || !key || !Number.isFinite(delta) || delta === 0) return;
+  const baseline = readDecayedSignal(signalMap, key, recoModel.timeDecayHalfLifeDays);
+  const next = clampNumber(baseline + delta, minVal, maxVal);
+  signalMap[key] = { value: next, last_updated: new Date().toISOString() };
+}
+
+function getMoodPreferenceScore(moodTokens) {
+  if (!Array.isArray(moodTokens) || !moodTokens.length) return 0;
+  let sum = 0;
+  for (const tok of moodTokens) {
+    sum += readDecayedSignal(recoProfile.moodSignals, normText(tok), recoModel.timeDecayHalfLifeDays);
+  }
+  return sum;
+}
+
+function noteQualityEvent(eventType, payload = {}) {
+  if (eventType === 'quality_snapshot') return;
+  sessionQuality.eventCounts[eventType] = Number(sessionQuality.eventCounts[eventType] || 0) + 1;
+  if (eventType === 'playlist_generate') sessionQuality.playlistGenerateCount += 1;
+  if (eventType === 'playlist_save') sessionQuality.playlistSaveCount += 1;
+  if (eventType === 'playlist_completed') sessionQuality.playlistCompletedCount += 1;
+  if (eventType === 'playlist_abandoned') sessionQuality.playlistAbandonedCount += 1;
+  if (eventType === 'playlist_impression') sessionQuality.playlistImpressionCount += 1;
+  if (eventType === 'track_open') sessionQuality.trackOpenCount += 1;
+  if (eventType === 'track_like') sessionQuality.trackLikeCount += 1;
+  if (eventType === 'track_skip') sessionQuality.trackSkipCount += 1;
+  if (eventType === 'track_mismatch') sessionQuality.trackMismatchCount += 1;
+  if (eventType === 'track_rate') {
+    const rating = toNumberOr(0, payload?.metadata?.rating);
+    if (rating > 0) {
+      sessionQuality.ratingCount += 1;
+      sessionQuality.ratingSum += rating;
+    }
+  }
+}
+
+function buildQualitySnapshot(reason) {
+  const impressions = Math.max(0, sessionQuality.playlistImpressionCount);
+  const opens = Math.max(0, sessionQuality.trackOpenCount);
+  const playlists = Math.max(0, sessionQuality.playlistGenerateCount);
+  const avgRating = sessionQuality.ratingCount
+    ? sessionQuality.ratingSum / sessionQuality.ratingCount
+    : null;
+
+  return {
+    reason,
+    model_version: recoModel.version,
+    session_age_seconds: Math.floor((Date.now() - sessionQuality.startedAt) / 1000),
+    event_counts: sessionQuality.eventCounts,
+    playlist_generates: playlists,
+    playlist_saves: sessionQuality.playlistSaveCount,
+    playlist_completed: sessionQuality.playlistCompletedCount,
+    playlist_abandoned: sessionQuality.playlistAbandonedCount,
+    impressions,
+    track_opens: opens,
+    track_likes: sessionQuality.trackLikeCount,
+    track_skips: sessionQuality.trackSkipCount,
+    mismatches: sessionQuality.trackMismatchCount,
+    ctr: impressions ? opens / impressions : null,
+    save_rate: playlists ? sessionQuality.playlistSaveCount / playlists : null,
+    completion_rate: playlists ? sessionQuality.playlistCompletedCount / playlists : null,
+    avg_rating: avgRating
+  };
+}
+
+async function flushQualityMetrics(reason = 'manual') {
+  const totalEvents = Object.values(sessionQuality.eventCounts).reduce((sum, n) => sum + Number(n || 0), 0);
+  if (!totalEvents) return;
+  const metrics = buildQualitySnapshot(reason);
+
+  if (!canWriteQualityMetrics) {
+    if (canWriteRecoEvents) {
+      recordRecoEvent('quality_snapshot', {
+        source: 'session_metrics',
+        metadata: metrics
+      });
+    }
+    return;
+  }
+
+  try {
+    const { data: { session } } = await _supabase.auth.getSession();
+    if (!session) return;
+    const row = {
+      user_id: session.user.id,
+      session_id: RECO_SESSION_ID,
+      reason,
+      metrics,
+      created_at: new Date().toISOString()
+    };
+    const { error } = await _supabase.from('recommendation_quality_metrics').insert(row);
+    if (error) {
+      if (/recommendation_quality_metrics/i.test(error.message || '')) {
+        canWriteQualityMetrics = false;
+      }
+      if (canWriteRecoEvents) {
+        recordRecoEvent('quality_snapshot', {
+          source: 'session_metrics',
+          metadata: metrics
+        });
+      }
+      return;
+    }
+    sessionQuality.lastFlushAt = Date.now();
+  } catch (e) {
+    if (canWriteRecoEvents) {
+      recordRecoEvent('quality_snapshot', {
+        source: 'session_metrics',
+        metadata: metrics
+      });
+    }
+  }
+}
+
+function ensureQualityFlushTimer() {
+  if (qualityFlushTimerId) return;
+  qualityFlushTimerId = window.setInterval(() => {
+    flushQualityMetrics('interval');
+  }, 90000);
+}
+
+function stopQualityFlushTimer() {
+  if (!qualityFlushTimerId) return;
+  clearInterval(qualityFlushTimerId);
+  qualityFlushTimerId = null;
+}
+
+function sanitizeRecoModel(raw) {
+  const base = JSON.parse(JSON.stringify(DEFAULT_RECO_MODEL));
+  if (!raw || typeof raw !== 'object') return base;
+
+  base.version = String(raw.version || base.version);
+  base.updated_at = raw.updated_at || null;
+  base.explorationEpsilon = clampNumber(
+    toNumberOr(base.explorationEpsilon, raw.exploration_epsilon ?? raw.explorationEpsilon),
+    0.01,
+    0.45
+  );
+  base.timeDecayHalfLifeDays = clampNumber(
+    toNumberOr(base.timeDecayHalfLifeDays, raw.time_decay_half_life_days ?? raw.timeDecayHalfLifeDays),
+    3,
+    120
+  );
+  base.maxPerArtistSmall = clampNumber(toNumberOr(base.maxPerArtistSmall, raw.max_per_artist_small ?? raw.maxPerArtistSmall), 1, 6);
+  base.maxPerArtistMedium = clampNumber(toNumberOr(base.maxPerArtistMedium, raw.max_per_artist_medium ?? raw.maxPerArtistMedium), 1, 8);
+  base.maxPerArtistLarge = clampNumber(toNumberOr(base.maxPerArtistLarge, raw.max_per_artist_large ?? raw.maxPerArtistLarge), 1, 10);
+
+  const incomingWeights = raw.weights || {};
+  Object.keys(base.weights).forEach(k => {
+    base.weights[k] = toNumberOr(base.weights[k], incomingWeights[k]);
+  });
+
+  return base;
+}
+
+async function loadRecoModelConfig() {
+  if (!canWriteModelConfig) return;
+  recoModel = JSON.parse(JSON.stringify(DEFAULT_RECO_MODEL));
+  try {
+    const { data: { session } } = await _supabase.auth.getSession();
+    if (!session) return;
+
+    const { data, error } = await _supabase
+      .from('recommendation_model_config')
+      .select('version,weights,exploration_epsilon,time_decay_half_life_days,max_per_artist_small,max_per_artist_medium,max_per_artist_large,updated_at,is_active')
+      .eq('is_active', true)
+      .order('updated_at', { ascending: false })
+      .limit(1);
+
+    if (error) {
+      if (/recommendation_model_config/i.test(error.message || '')) {
+        canWriteModelConfig = false;
+      }
+      return;
+    }
+
+    const row = (data || [])[0] || null;
+    if (!row) return;
+    recoModel = sanitizeRecoModel(row);
+  } catch (e) {
+    // Keep default local model when remote model fetch fails.
+  }
+}
+
+function makePlaylistSessionId() {
+  return `pl_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function classifyBucket(ms) {
+  if (ms < 45000) return 'short';
+  if (ms < 180000) return 'medium';
+  return 'long';
+}
+
+function startPlaylistSession(playlistData, mood) {
+  const tracks = Array.isArray(playlistData?.tracks) ? playlistData.tracks : [];
+  activePlaylistSession = {
+    id: makePlaylistSessionId(),
+    title: playlistData?.title || 'untitled',
+    mood: mood || null,
+    openedAt: Date.now(),
+    trackCount: tracks.length,
+    trackKeys: new Set(tracks.map(t => makeTrackKey(t.artist, t.track))),
+    openedTrackKeys: new Set(),
+    closed: false
+  };
+}
+
+function markPlaylistTrackOpen(artistName, trackName) {
+  if (!activePlaylistSession || activePlaylistSession.closed) return;
+  const key = makeTrackKey(artistName, trackName);
+  if (!activePlaylistSession.trackKeys.has(key)) return;
+  activePlaylistSession.openedTrackKeys.add(key);
+  const dwellMs = Date.now() - activePlaylistSession.openedAt;
+  recordRecoEvent('track_play_time_bucket', {
+    artist_id: inferArtistIdByName(artistName),
+    artist_name: artistName,
+    track_name: trackName,
+    source: 'playlist_output',
+    mood: activePlaylistSession.mood,
+    metadata: {
+      bucket: classifyBucket(dwellMs),
+      dwell_seconds: Math.floor(dwellMs / 1000),
+      opened_ratio: activePlaylistSession.trackCount
+        ? Number((activePlaylistSession.openedTrackKeys.size / activePlaylistSession.trackCount).toFixed(3))
+        : 0
+    }
+  });
+}
+
+function finalizePlaylistSession(reason = 'closed') {
+  if (!activePlaylistSession || activePlaylistSession.closed) return;
+  const opened = activePlaylistSession.openedTrackKeys.size;
+  const total = Math.max(1, activePlaylistSession.trackCount);
+  const ratio = opened / total;
+  const dwellMs = Date.now() - activePlaylistSession.openedAt;
+  const completed = ratio >= 0.45 || opened >= Math.max(2, Math.ceil(total * 0.5));
+  const eventType = completed ? 'playlist_completed' : 'playlist_abandoned';
+
+  activePlaylistSession.closed = true;
+
+  recordRecoEvent(eventType, {
+    source: 'playlist_output',
+    mood: activePlaylistSession.mood,
+    metadata: {
+      playlist_id: activePlaylistSession.id,
+      playlist_title: activePlaylistSession.title,
+      reason,
+      track_count: total,
+      opened_tracks: opened,
+      opened_ratio: Number(ratio.toFixed(3)),
+      dwell_seconds: Math.floor(dwellMs / 1000)
+    }
+  });
+
+  flushQualityMetrics(completed ? 'playlist_completed' : 'playlist_closed');
+  activePlaylistSession = null;
+}
+
+function normText(str) {
+  return String(str || '').toLowerCase().replace(/[^a-z0-9\s]/g, ' ').replace(/\s+/g, ' ').trim();
+}
+
+function tokenize(str) {
+  const s = normText(str);
+  if (!s) return [];
+  return s.split(' ').filter(tok => tok.length >= 2);
+}
+
+function parseCsvLike(str) {
+  return String(str || '')
+    .split(',')
+    .map(s => s.trim())
+    .filter(Boolean);
+}
+
+function artistTokenSet(artist) {
+  return new Set(tokenize(`${artist.name} ${artist.genre} ${artist.about} ${artist.sound} ${artist.moods.join(' ')}`));
+}
+
+function artistSimilarityScore(a, b) {
+  const sa = artistTokenSet(a);
+  const sb = artistTokenSet(b);
+  if (!sa.size || !sb.size) return 0;
+  let overlap = 0;
+  for (const t of sa) if (sb.has(t)) overlap += 1;
+  return overlap / Math.max(6, Math.min(sa.size, sb.size));
+}
+
+function resolveArtistIdLoose(name) {
+  const q = normText(name);
+  if (!q) return null;
+  const exact = ARTISTS.find(a => normText(a.name) === q);
+  if (exact) return exact.id;
+  const partial = ARTISTS.find(a => normText(a.name).includes(q) || q.includes(normText(a.name)));
+  return partial ? partial.id : null;
+}
+
+function collectPlaylistContext(moodText) {
+  const refInput = document.getElementById('ctxReferenceArtists')?.value || '';
+  const avoidInput = document.getElementById('ctxAvoidArtists')?.value || '';
+  const place = (document.getElementById('ctxPlace')?.value || '').trim();
+  const color = (document.getElementById('ctxColor')?.value || '').trim();
+  const experience = (document.getElementById('ctxExperience')?.value || '').trim();
+
+  const referenceNames = parseCsvLike(refInput);
+  const avoidNames = parseCsvLike(avoidInput);
+
+  // Natural-language fallback: "like X but not Y"
+  const m = String(moodText || '').match(/like\s+(.+?)\s+but\s+not\s+(.+)/i);
+  if (m) {
+    if (!referenceNames.length) referenceNames.push(m[1].trim());
+    if (!avoidNames.length) avoidNames.push(m[2].trim());
+  }
+
+  const referenceIds = referenceNames.map(resolveArtistIdLoose).filter(Boolean);
+  const avoidIds = avoidNames.map(resolveArtistIdLoose).filter(Boolean);
+
+  return {
+    referenceNames,
+    avoidNames,
+    referenceIds,
+    avoidIds,
+    place,
+    color,
+    experience
+  };
+}
+
+function makeTrackKey(artistName, trackName) {
+  return `${normText(artistName)}::${normText(trackName)}`;
+}
+
+function inferArtistIdByName(artistName) {
+  const name = normText(artistName);
+  const a = ARTISTS.find(x => normText(x.name) === name);
+  return a ? a.id : null;
+}
+
+function bumpRecentTrack(trackKey) {
+  const list = recoProfile.recentTrackKeys || [];
+  const next = [trackKey, ...list.filter(k => k !== trackKey)].slice(0, 120);
+  recoProfile.recentTrackKeys = next;
+}
+
+function moodMatchScore(artist, moodTokens) {
+  if (!moodTokens.length) return 0;
+  const artistBlob = `${artist.name} ${artist.genre} ${artist.about} ${artist.sound} ${artist.moods.join(' ')}`;
+  const hay = normText(artistBlob);
+  let score = 0;
+  for (const tok of moodTokens) {
+    if (hay.includes(tok)) score += 1;
+  }
+  return score;
+}
+
+function buildRecommendationCandidates(artistPool, mood, wanted = 40, context = null) {
+  const w = recoModel.weights || DEFAULT_RECO_MODEL.weights;
+  const moodTokens = tokenize(mood);
+  const placeTokens = tokenize(context?.place || '');
+  const colorTokens = tokenize(context?.color || '');
+  const experienceTokens = tokenize(context?.experience || '');
+  const moodPhraseSignal = readDecayedSignal(recoProfile.moodSignals, normText(mood), recoModel.timeDecayHalfLifeDays);
+  const referenceArtists = (context?.referenceIds || []).map(id => ARTISTS.find(a => a.id === id)).filter(Boolean);
+  const avoidSet = new Set(context?.avoidIds || []);
+  const seen = new Set();
+  const candidates = [];
+
+  for (const artist of artistPool) {
+    if (avoidSet.has(artist.id)) continue;
+
+    const artistInterest = Number(userProfile.artistInterests?.[artist.id] || 0);
+    const artistSignal = readDecayedSignal(recoProfile.artistSignals, artist.id, recoModel.timeDecayHalfLifeDays);
+    const favBonus = favoriteArtistIds.has(artist.id) ? w.favoriteBonus : 0;
+    const moodScore = moodMatchScore(artist, moodTokens);
+    const placeScore = moodMatchScore(artist, placeTokens);
+    const colorScore = moodMatchScore(artist, colorTokens);
+    const experienceScore = moodMatchScore(artist, experienceTokens);
+    const moodPreference = moodPhraseSignal + getMoodPreferenceScore([...moodTokens, ...artist.moods]);
+    const referenceScore = referenceArtists.length
+      ? Math.max(...referenceArtists.map(ref => artistSimilarityScore(artist, ref)))
+      : 0;
+
+    for (const track of artist.tracks) {
+      const key = makeTrackKey(artist.name, track);
+      if (seen.has(key)) continue;
+      seen.add(key);
+
+      const tSignal = readDecayedSignal(recoProfile.trackSignals, key, recoModel.timeDecayHalfLifeDays);
+      const repeatedPenalty = (recoProfile.recentTrackKeys || []).includes(key) ? w.repeatedPenalty : 0;
+      const randomJitter = Math.random() * Math.max(0, w.randomJitterMax);
+
+      const score =
+        artistInterest * w.artistInterest +
+        artistSignal * w.artistSignal +
+        tSignal * w.trackSignal +
+        moodScore * w.moodScore +
+        placeScore * w.placeScore +
+        colorScore * w.colorScore +
+        experienceScore * w.experienceScore +
+        referenceScore * w.referenceScore +
+        moodPreference * w.moodPreference +
+        favBonus -
+        repeatedPenalty +
+        randomJitter;
+
+      candidates.push({
+        artist_id: artist.id,
+        artist_name: artist.name,
+        track_name: track,
+        score
+      });
+    }
+  }
+
+  const ranked = candidates.sort((a, b) => b.score - a.score);
+  if (!ranked.length) return [];
+
+  const epsilon = recoModel.explorationEpsilon;
+  const target = Math.max(1, wanted);
+  const exploitCount = Math.max(1, Math.floor(target * (1 - epsilon)));
+  const top = ranked.slice(0, exploitCount);
+  const tail = ranked.slice(exploitCount);
+  const explore = [];
+  while (explore.length < target - top.length && tail.length) {
+    const idx = Math.floor(Math.random() * tail.length);
+    explore.push(tail[idx]);
+    tail.splice(idx, 1);
+  }
+
+  const mixed = [...top, ...explore].sort((a, b) => b.score - a.score);
+
+  // Cap over-representation so playlists feel varied, not repetitive.
+  const maxPerArtist = wanted <= 6
+    ? recoModel.maxPerArtistSmall
+    : (wanted <= 14 ? recoModel.maxPerArtistMedium : recoModel.maxPerArtistLarge);
+  const artistCounts = {};
+  const capped = [];
+  for (const c of mixed) {
+    const n = Number(artistCounts[c.artist_name] || 0);
+    if (n >= maxPerArtist) continue;
+    artistCounts[c.artist_name] = n + 1;
+    capped.push(c);
+  }
+
+  // If capping got too strict for tiny pools, relax with best remaining tracks.
+  if (capped.length < Math.max(4, wanted)) {
+    const existing = new Set(capped.map(c => makeTrackKey(c.artist_name, c.track_name)));
+    for (const c of mixed) {
+      const key = makeTrackKey(c.artist_name, c.track_name);
+      if (existing.has(key)) continue;
+      capped.push(c);
+      existing.add(key);
+      if (capped.length >= wanted) break;
+    }
+  }
+
+  const byArtist = {};
+  for (const c of capped) {
+    if (!byArtist[c.artist_name]) byArtist[c.artist_name] = [];
+    byArtist[c.artist_name].push(c);
+  }
+
+  // Re-order to reduce same-artist adjacency.
+  const ordered = [];
+  let lastArtist = null;
+  while (ordered.length < target) {
+    const buckets = Object.entries(byArtist)
+      .filter(([, arr]) => arr.length > 0)
+      .sort((a, b) => b[1][0].score - a[1][0].score);
+    if (!buckets.length) break;
+
+    let pickBucket = buckets[0];
+    if (pickBucket[0] === lastArtist && buckets.length > 1) pickBucket = buckets[1];
+    const chosen = pickBucket[1].shift();
+    ordered.push(chosen);
+    lastArtist = chosen.artist_name;
+  }
+
+  return ordered.slice(0, target);
+}
+
+function buildLocalPlaylistData(artistPool, mood, length, precomputedCandidates, context = null) {
+  const candidates = precomputedCandidates && precomputedCandidates.length
+    ? precomputedCandidates
+    : buildRecommendationCandidates(artistPool, mood, Math.max(length * 3, 24), context);
+  const picks = candidates.slice(0, length);
+  const titleMood = mood.charAt(0).toUpperCase() + mood.slice(1);
+  return {
+    title: `${titleMood} — a soft wave`,
+    tracks: picks.map((c, idx) => ({
+      artist: c.artist_name,
+      track: c.track_name,
+      reason: idx === 0
+        ? `you open with this because it locks into ${mood.toLowerCase()} instantly and sets the emotional temperature.`
+        : `you stay in this pocket because it extends the same ${mood.toLowerCase()} feeling without flattening the energy.`
+    }))
+  };
+}
+
+function ingestSignal(eventType, payload) {
+  const mood = payload.mood || null;
+  const artistId = payload.artist_id || (payload.artist_name ? inferArtistIdByName(payload.artist_name) : null);
+  const artistName = payload.artist_name || (artistId ? ARTISTS.find(a => a.id === artistId)?.name : null);
+  const trackName = payload.track_name || null;
+  const rating = toNumberOr(0, payload?.metadata?.rating);
+
+  if (artistId) {
+    const artistDeltaMap = {
+      artist_view: 0.35,
+      track_open: 0.28,
+      favorite_add: 2.2,
+      favorite_remove: -1,
+      playlist_generate: 0.2,
+      playlist_save: 1.4,
+      track_like: 1.5,
+      track_skip: -1.2,
+      track_mismatch: -1.8,
+      playlist_completed: 1.1,
+      playlist_abandoned: -0.8
+    };
+    const artistDelta = toNumberOr(0, artistDeltaMap[eventType]);
+    writeSignal(recoProfile.artistSignals, artistId, artistDelta, -30, 80);
+  }
+
+  if (mood) {
+    const moodKey = normText(mood);
+    const moodDeltaMap = {
+      playlist_generate: 1,
+      playlist_save: 1.6,
+      playlist_completed: 1.2,
+      playlist_abandoned: -0.7,
+      track_like: 0.9,
+      track_skip: -0.45
+    };
+    const moodDelta = toNumberOr(0.25, moodDeltaMap[eventType]);
+    writeSignal(recoProfile.moodSignals, moodKey, moodDelta, -20, 60);
+  }
+
+  if (artistName && trackName) {
+    const key = makeTrackKey(artistName, trackName);
+    let delta = 0.0;
+    if (eventType === 'track_open') delta = 0.8;
+    if (eventType === 'playlist_impression') delta = 0.22;
+    if (eventType === 'favorite_add') delta = 1.8;
+    if (eventType === 'favorite_remove') delta = -0.8;
+    if (eventType === 'playlist_save') delta = 1.2;
+    if (eventType === 'track_like') delta = 1.3;
+    if (eventType === 'track_skip') delta = -1.1;
+    if (eventType === 'track_mismatch') delta = -2.5;
+    if (eventType === 'track_play_time_bucket') {
+      const bucket = String(payload?.metadata?.bucket || '').toLowerCase();
+      if (bucket === 'long') delta = 0.7;
+      if (bucket === 'medium') delta = 0.22;
+      if (bucket === 'short') delta = -0.35;
+    }
+    if (eventType === 'track_rate') {
+      if (rating === 0) delta = -0.2;
+      else delta = (rating - 3) * 0.95;
+    }
+    if (eventType === 'playlist_completed') delta = 0.75;
+    if (eventType === 'playlist_abandoned') delta = -0.35;
+
+    writeSignal(recoProfile.trackSignals, key, delta, -35, 90);
+    if (eventType === 'track_open' || eventType === 'playlist_impression') bumpRecentTrack(key);
+  }
+
+  saveRecoProfile();
+}
+
+async function recordRecoEvent(eventType, payload = {}) {
+  noteQualityEvent(eventType, payload);
+  ingestSignal(eventType, payload);
+
+  if (!canWriteRecoEvents) return;
+
+  try {
+    const { data: { session } } = await _supabase.auth.getSession();
+    if (!session) return;
+    const row = {
+      user_id: session.user.id,
+      session_id: RECO_SESSION_ID,
+      event_type: eventType,
+      source: payload.source || null,
+      mood: payload.mood || null,
+      artist_id: payload.artist_id || null,
+      artist_name: payload.artist_name || null,
+      track_name: payload.track_name || null,
+      rank_score: typeof payload.rank_score === 'number' ? payload.rank_score : null,
+      metadata: {
+        ...(payload.metadata || {}),
+        model_version: recoModel.version
+      }
+    };
+    const { error } = await _supabase.from('recommendation_events').insert(row);
+    if (error) {
+      if (/recommendation_events/i.test(error.message || '')) {
+        canWriteRecoEvents = false;
+        return;
+      }
+      console.warn('recordRecoEvent:', error.message);
+    }
+  } catch(e) {
+    // Keep recommendation flow resilient even if telemetry fails.
+  }
+
+  if (eventType === 'playlist_save' || eventType === 'playlist_completed' || eventType === 'playlist_abandoned') {
+    flushQualityMetrics(eventType);
+  }
+}
+
+const trackRatingMap = {};
+const trackRatingAggregateMap = {};
+const trackRatingFetchInFlight = new Set();
+
+function makeTrackRatingKey(artistName, trackName) {
+  return makeTrackKey(artistName, trackName);
+}
+
+function escapeJsSq(str) {
+  return String(str || '').replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+}
+
+function getAggregateRatingText(artistName, trackName) {
+  const key = makeTrackRatingKey(artistName, trackName);
+  const agg = trackRatingAggregateMap[key];
+  if (!agg || !agg.count) return 'community: no ratings yet';
+  return `community: ${agg.avg.toFixed(1)}/5 (${agg.count})`;
+}
+
+function renderTrackRatingWidget(artistName, trackName, source = 'track') {
+  const key = makeTrackRatingKey(artistName, trackName);
+  const userRating = Number(trackRatingMap[key] || 0);
+  ensureTrackAggregateRating(artistName, trackName);
+  const buttons = [1, 2, 3, 4, 5].map(n =>
+    `<button class="track-rate-btn${userRating === n ? ' active' : ''}" title="Rate ${n}/5" data-rate="${n}" onclick="setTrackRating('${escapeJsSq(artistName)}','${escapeJsSq(trackName)}',${n},'${escapeJsSq(source)}')">${n}</button>`
+  ).join('');
+  return `<div class="track-rating-wrap" data-rating-key="${key}">` +
+    `<span class="track-rating-meta">${getAggregateRatingText(artistName, trackName)}</span>` +
+    `<div class="track-rating-buttons">${buttons}</div>` +
+  `</div>`;
+}
+
+function renderTrackMismatchButton(artistName, trackName, source = 'track') {
+  return `<button class="track-rate-btn" title="This link/song match looks wrong" onclick="reportWrongMatch('${escapeJsSq(artistName)}','${escapeJsSq(trackName)}','${escapeJsSq(source)}')">wrong match</button>`;
+}
+
+function reportWrongMatch(artistName, trackName, source = 'track') {
+  const artistId = inferArtistIdByName(artistName);
+  recordRecoEvent('track_mismatch', {
+    artist_id: artistId,
+    artist_name: artistName,
+    track_name: trackName,
+    source,
+    metadata: { reason: 'user_marked_wrong_match' }
+  });
+  showTooltip('Thanks - we will avoid this mismatch');
+}
+
+function refreshTrackRatingWidgets(artistName, trackName) {
+  const key = makeTrackRatingKey(artistName, trackName);
+  const nodes = document.querySelectorAll(`[data-rating-key="${key}"]`);
+  if (!nodes.length) return;
+  const userRating = Number(trackRatingMap[key] || 0);
+  const label = `${getAggregateRatingText(artistName, trackName)}`;
+  nodes.forEach(node => {
+    const meta = node.querySelector('.track-rating-meta');
+    if (meta) meta.textContent = label;
+    node.querySelectorAll('.track-rate-btn').forEach(btn => {
+      const rate = Number(btn.getAttribute('data-rate'));
+      btn.classList.toggle('active', rate === userRating);
+    });
+  });
+}
+
+async function ensureTrackAggregateRating(artistName, trackName) {
+  const key = makeTrackRatingKey(artistName, trackName);
+  if (trackRatingAggregateMap[key] || trackRatingFetchInFlight.has(key) || !canWriteTrackRatings) return;
+  trackRatingFetchInFlight.add(key);
+  try {
+    const { data, error } = await _supabase
+      .from('track_rating_stats')
+      .select('rating_avg,rating_count')
+      .eq('artist_name', artistName)
+      .eq('track_name', trackName);
+    if (error) {
+      if (/track_ratings|track_rating_stats/i.test(error.message || '')) canWriteTrackRatings = false;
+      return;
+    }
+    const row = (data || [])[0] || null;
+    const count = Number(row?.rating_count || 0);
+    const avg = Number(row?.rating_avg || 0);
+    trackRatingAggregateMap[key] = {
+      count,
+      avg: count ? avg : 0
+    };
+    refreshTrackRatingWidgets(artistName, trackName);
+  } catch (e) {
+    // Keep UI functional even if aggregate fetch fails.
+  } finally {
+    trackRatingFetchInFlight.delete(key);
+  }
+}
+
+async function loadTrackRatings() {
+  if (!canWriteTrackRatings) return;
+  try {
+    const { data: { session } } = await _supabase.auth.getSession();
+    if (!session) {
+      Object.keys(trackRatingMap).forEach(k => delete trackRatingMap[k]);
+      return;
+    }
+    const { data, error } = await _supabase
+      .from('track_ratings')
+      .select('artist_name,track_name,rating')
+      .eq('user_id', session.user.id)
+      .limit(3000);
+    if (error) {
+      if (/track_ratings/i.test(error.message || '')) canWriteTrackRatings = false;
+      return;
+    }
+    Object.keys(trackRatingMap).forEach(k => delete trackRatingMap[k]);
+    (data || []).forEach(row => {
+      const key = makeTrackRatingKey(row.artist_name, row.track_name);
+      trackRatingMap[key] = Number(row.rating || 0);
+    });
+  } catch (e) {}
+}
+
+async function setTrackRating(artistName, trackName, rating, source = 'track') {
+  if (!canWriteTrackRatings) {
+    showTooltip('Track ratings table is not set up yet');
+    return;
+  }
+  const { data: { session } } = await _supabase.auth.getSession();
+  if (!session) {
+    showTooltip('Sign in to rate tracks');
+    return;
+  }
+
+  const key = makeTrackRatingKey(artistName, trackName);
+  const prev = Number(trackRatingMap[key] || 0);
+  const next = (prev === rating) ? 0 : rating;
+
+  try {
+    if (next === 0) {
+      const { error } = await _supabase
+        .from('track_ratings')
+        .delete()
+        .eq('user_id', session.user.id)
+        .eq('artist_name', artistName)
+        .eq('track_name', trackName);
+      if (error) throw error;
+      delete trackRatingMap[key];
+    } else {
+      const row = {
+        user_id: session.user.id,
+        artist_name: artistName,
+        track_name: trackName,
+        rating: next,
+        updated_at: new Date().toISOString()
+      };
+      const { error } = await _supabase
+        .from('track_ratings')
+        .upsert(row, { onConflict: 'user_id,artist_name,track_name' });
+      if (error) throw error;
+      trackRatingMap[key] = next;
+    }
+
+    const agg = trackRatingAggregateMap[key] || { avg: 0, count: 0 };
+    const sum = agg.avg * agg.count - prev + next;
+    const count = agg.count + (prev ? 0 : (next ? 1 : 0)) - (prev && !next ? 1 : 0);
+    trackRatingAggregateMap[key] = {
+      count: Math.max(0, count),
+      avg: Math.max(0, count) ? (sum / Math.max(1, count)) : 0
+    };
+
+    const artistId = inferArtistIdByName(artistName);
+    if (next >= 4) {
+      recordRecoEvent('track_like', { artist_id: artistId, artist_name: artistName, track_name: trackName, source });
+    } else if (next > 0 && next <= 2) {
+      recordRecoEvent('track_skip', { artist_id: artistId, artist_name: artistName, track_name: trackName, source });
+    }
+    recordRecoEvent('track_rate', {
+      artist_id: artistId,
+      artist_name: artistName,
+      track_name: trackName,
+      source,
+      metadata: { rating: next }
+    });
+
+    refreshTrackRatingWidgets(artistName, trackName);
+    showTooltip(next ? `Rated ${next}/5` : 'Rating cleared');
+  } catch (e) {
+    if (/track_ratings/i.test(e.message || '')) canWriteTrackRatings = false;
+    showTooltip('Could not save rating');
+  }
+}
+
+// ============================================================
 // API KEY
 // ============================================================
 
@@ -1766,29 +2741,105 @@ function detectKeyType(val) {
   }
 }
 
-function saveApiKey() {
+async function loadAccountApiKey() {
+  if (USE_SHARED_PROXY) return;
+  if (!canWriteUserApiKeys) return;
+  try {
+    const { data: { session } } = await _supabase.auth.getSession();
+    if (!session) return;
+    const { data, error } = await _supabase
+      .from('user_api_keys')
+      .select('provider,api_key,selected_model')
+      .eq('user_id', session.user.id)
+      .single();
+    if (error) {
+      if (/user_api_keys/i.test(error.message || '')) canWriteUserApiKeys = false;
+      return;
+    }
+    if (!data || !data.api_key) return;
+    if (data.provider === 'openrouter') {
+      OPENROUTER_KEY = data.api_key;
+      GEMINI_API_KEY = '';
+      SELECTED_MODEL = data.selected_model || 'google/gemini-2.0-flash-001';
+    } else {
+      GEMINI_API_KEY = data.api_key;
+      OPENROUTER_KEY = '';
+    }
+  } catch (e) {}
+}
+
+async function persistAccountApiKey(provider, keyValue) {
+  if (USE_SHARED_PROXY) return;
+  if (!canWriteUserApiKeys) return;
+  try {
+    const { data: { session } } = await _supabase.auth.getSession();
+    if (!session) return;
+    const row = {
+      user_id: session.user.id,
+      provider,
+      api_key: keyValue,
+      selected_model: provider === 'openrouter' ? SELECTED_MODEL : null,
+      updated_at: new Date().toISOString()
+    };
+    const { error } = await _supabase
+      .from('user_api_keys')
+      .upsert(row, { onConflict: 'user_id' });
+    if (error && /user_api_keys/i.test(error.message || '')) {
+      canWriteUserApiKeys = false;
+    }
+  } catch (e) {}
+}
+
+async function clearAccountApiKey() {
+  if (USE_SHARED_PROXY) return;
+  if (!canWriteUserApiKeys) return;
+  try {
+    const { data: { session } } = await _supabase.auth.getSession();
+    if (!session) return;
+    await _supabase.from('user_api_keys').delete().eq('user_id', session.user.id);
+  } catch (e) {}
+}
+
+async function saveApiKey() {
+  if (USE_SHARED_PROXY) {
+    document.getElementById('apikeyModal').style.display = 'none';
+    renderAll();
+    return;
+  }
   const val = document.getElementById('unifiedKeyInput').value.trim();
   if (!val) { skipApiKey(); return; }
   if (val.startsWith('sk-or')) {
     OPENROUTER_KEY = val;
     GEMINI_API_KEY = '';
     SELECTED_MODEL = 'google/gemini-2.0-flash-001';
+    await persistAccountApiKey('openrouter', val);
   } else {
     GEMINI_API_KEY = val;
     OPENROUTER_KEY = '';
+    await persistAccountApiKey('gemini', val);
   }
   document.getElementById('apikeyModal').style.display = 'none';
   renderAll();
 }
 
-function skipApiKey() {
+async function skipApiKey() {
+  if (USE_SHARED_PROXY) {
+    document.getElementById('apikeyModal').style.display = 'none';
+    renderAll();
+    return;
+  }
   GEMINI_API_KEY = '';
   OPENROUTER_KEY = '';
+  await clearAccountApiKey();
   document.getElementById('apikeyModal').style.display = 'none';
   renderAll();
 }
 
 function openApiKeyModal() {
+  if (USE_SHARED_PROXY) {
+    showTooltip('Shared protected API key mode is active');
+    return;
+  }
   const current = OPENROUTER_KEY || GEMINI_API_KEY || '';
   document.getElementById('unifiedKeyInput').value = current;
   detectKeyType(current);
@@ -1799,7 +2850,49 @@ function openApiKeyModal() {
 // GEMINI API
 // ============================================================
 
+async function callServerAIProxy({ model, messages, prompt, temperature = 0.75, max_tokens = 8000 }) {
+  const { data: { session } } = await _supabase.auth.getSession();
+  if (!session?.access_token) throw new Error('Sign in required');
+
+  const payload = {
+    model,
+    messages,
+    prompt,
+    temperature,
+    max_tokens
+  };
+
+  const res = await fetch(`${SUPABASE_URL}/functions/v1/${SHARED_PROXY_FUNCTION}`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${session.access_token}`,
+      'apikey': SUPABASE_ANON
+    },
+    body: JSON.stringify(payload)
+  });
+
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw new Error(data?.error || `Proxy HTTP ${res.status}`);
+  }
+
+  const content = data?.content;
+  if (!content || typeof content !== 'string') {
+    throw new Error('Proxy returned empty response');
+  }
+  return content;
+}
+
 async function callGemini(prompt, temperature = 0.85) {
+  if (USE_SHARED_PROXY) {
+    return callServerAIProxy({
+      model: SHARED_PROXY_MODEL,
+      messages: [{ role: 'user', content: prompt }],
+      temperature,
+      max_tokens: 8000
+    });
+  }
   if (!GEMINI_API_KEY) throw new Error('No API key set');
   const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${GEMINI_API_KEY}`, {
     method: 'POST',
@@ -1827,6 +2920,14 @@ async function callGemini(prompt, temperature = 0.85) {
  * @returns {Promise<string>}
  */
 async function callOpenRouter(messages, temperature = 0.75) {
+  if (USE_SHARED_PROXY) {
+    return callServerAIProxy({
+      model: SELECTED_MODEL || SHARED_PROXY_MODEL,
+      messages,
+      temperature,
+      max_tokens: 8000
+    });
+  }
   if (!OPENROUTER_KEY) throw new Error('No OpenRouter key');
   const res = await fetch('https://openrouter.ai/api/v1/chat/completions', {
     method: 'POST',
@@ -1995,6 +3096,12 @@ function openDetail(artistId) {
   const artist = ARTISTS.find(a => a.id === artistId);
   if (!artist) return;
 
+  recordRecoEvent('artist_view', {
+    artist_id: artist.id,
+    artist_name: artist.name,
+    source: 'detail_panel'
+  });
+
   activeArtistId = artistId;
 
   document.querySelectorAll('.artist-card').forEach(c => {
@@ -2004,14 +3111,20 @@ function openDetail(artistId) {
   const panel = document.getElementById('detailInner');
   const moodTagsHtml = artist.moods.map(m => `<span class="mood-tag">${m}</span>`).join('');
   const tracksHtml = artist.tracks.map((t, i) => {
-    const raw = artist.name + ' ' + t;
-    const spotifyUrl = `https://open.spotify.com/search/${spotifyQ(raw)}`;
-    const appleMusicUrl = `music://music.apple.com/search?term=${appleQ(raw)}`;
-    return `<div class="track-item" style="display:flex;align-items:center;gap:0.75rem;padding:0.6rem 0;border-bottom:1px solid var(--border);">
+    const links = trackSearchLinks(artist.name, t);
+    const spotifyUrl = links.spotifyUrl;
+    const appleMusicUrl = links.appleUrl;
+    const verifyNote = links.verified ? '' : `<span style="font-size:0.5rem;color:var(--muted);letter-spacing:0.06em;">unverified match</span>`;
+    const mismatchBtn = links.verified ? '' : renderTrackMismatchButton(artist.name, t, 'artist_detail');
+    return `<div class="track-item" style="padding:0.6rem 0;border-bottom:1px solid var(--border);">
+      <div style="display:flex;align-items:center;gap:0.75rem;">
       <span class="track-num">0${i+1}</span>
       <span class="track-name" style="flex:1;">${t}</span>
-      <a href="${spotifyUrl}" target="_blank" class="track-spotify" style="text-decoration:none;">↗ Spotify</a>
-      <a href="${appleMusicUrl}" class="track-spotify" style="text-decoration:none;margin-left:0.5rem;">↗ Apple</a>
+      <a href="${spotifyUrl}" target="_blank" class="track-spotify rec-track-link" data-source="artist_detail" data-artist="${artist.name.replace(/"/g,'&quot;')}" data-track="${t.replace(/"/g,'&quot;')}" style="text-decoration:none;" title="Strict artist+track search">↗ Spotify</a>
+      <a href="${appleMusicUrl}" class="track-spotify rec-track-link" data-source="artist_detail" data-artist="${artist.name.replace(/"/g,'&quot;')}" data-track="${t.replace(/"/g,'&quot;')}" style="text-decoration:none;margin-left:0.5rem;" title="Strict artist+track search">↗ Apple</a>
+      </div>
+      <div style="display:flex;align-items:center;gap:0.45rem;margin-top:0.25rem;">${verifyNote}${mismatchBtn}</div>
+      ${renderTrackRatingWidget(artist.name, t, 'artist_detail')}
     </div>`;
   }).join('');
 
@@ -2325,6 +3438,11 @@ async function confirmChatSave(saveId) {
     tracks
   }).select().single();
   if (error) { console.error('confirmChatSave:', error); return; }
+  recordRecoEvent('playlist_save', {
+    source: 'chat_save',
+    mood: 'from chat',
+    metadata: { track_count: tracks.length }
+  });
   savedPlaylists.unshift({ id: data.id, title: data.name, mood: data.mood, tracks: data.tracks, savedAt: data.created_at });
   updateSavedCount();
   updateChatDownloadBtn();
@@ -2340,6 +3458,16 @@ function openPlaylistModal(preselectedIds) {
   document.getElementById('playlistModal').classList.add('open');
   if (preselectedIds) selectedArtistIds = preselectedIds;
   initArtistPool();
+  const ref = document.getElementById('ctxReferenceArtists');
+  const avoid = document.getElementById('ctxAvoidArtists');
+  const place = document.getElementById('ctxPlace');
+  const color = document.getElementById('ctxColor');
+  const experience = document.getElementById('ctxExperience');
+  if (ref) ref.value = '';
+  if (avoid) avoid.value = '';
+  if (place) place.value = '';
+  if (color) color.value = '';
+  if (experience) experience.value = '';
   // Show locked notice and hide pool controls when artists are preselected from grid
   const locked = preselectedIds && preselectedIds.length > 0;
   const notice = document.getElementById('artistPoolLockedNotice');
@@ -2381,8 +3509,11 @@ function onCustomLengthInput(input) {
 
 async function generatePlaylist() {
   const customMood = document.getElementById('customMood').value.trim();
-  const mood = customMood || selectedMood;
-  if (!mood) { alert('Please select or type a mood first.'); return; }
+  const experienceInput = document.getElementById('ctxExperience')?.value.trim() || '';
+  const mood = customMood || selectedMood || (experienceInput ? 'Experience-led journey' : '');
+  if (!mood) { alert('Please select/type a mood or describe an experience first.'); return; }
+
+  const context = collectPlaylistContext(mood);
 
   const checkedIds = getActivePoolIds();
   if (checkedIds.length === 0) { alert('Please select at least one artist first — use "Pick specific" then tap the artists you want.'); return; }
@@ -2392,23 +3523,52 @@ async function generatePlaylist() {
   btn.textContent = 'Generating...';
 
   const artistPool = ARTISTS.filter(a => checkedIds.includes(a.id));
+  const filteredPool = artistPool.filter(a => !(context.avoidIds || []).includes(a.id));
+  if (!filteredPool.length) {
+    alert('Your avoid list removed all artists from the current pool. Remove one avoid artist or broaden the pool.');
+    btn.disabled = false;
+    btn.textContent = 'Generate';
+    return;
+  }
+  const candidateTracks = buildRecommendationCandidates(filteredPool, mood, Math.max(selectedLength * 4, 24), context);
 
-  const artistContext = artistContextBlock(artistPool);
+  const artistContext = artistContextBlock(filteredPool);
+  const candidateContext = candidateTracks.slice(0, 50)
+    .map((c, i) => `${i + 1}. ${c.artist_name} — ${c.track_name}`)
+    .join('\n');
+  const contextNotes = [
+    context.referenceNames.length ? `Reference vibe artists: ${context.referenceNames.join(', ')}` : '',
+    context.avoidNames.length ? `Avoid these artists completely: ${context.avoidNames.join(', ')}` : '',
+    context.place ? `Listening place/context: ${context.place}` : '',
+    context.color ? `Color/texture feeling: ${context.color}` : '',
+    context.experience ? `Experience story: ${context.experience}` : ''
+  ].filter(Boolean).join('\n');
 
   const prompt = `You are an editorial music curator for a platform called The Soft Wave, which focuses on R&B, soul, neo-soul, alternative R&B, and related genres.
 
 Create a playlist with exactly ${selectedLength} tracks for this mood: "${mood}"
 
-ARTIST POOL (you MUST only use these ${artistPool.length} artists — do NOT add any other artists under any circumstances):
+ARTIST POOL (you MUST only use these ${filteredPool.length} artists — do NOT add any other artists under any circumstances):
 ${artistContext}
+
+USER CONTEXT:
+${contextNotes || 'No extra context provided.'}
+
+If an experience story is provided, prioritize emotional and narrative alignment with that story over generic mood matching.
 
 Rules:
 - ONLY use artists listed above. Using any artist not in the list above is a critical error.
+- ONLY use tracks from the candidate list below. Do not invent tracks outside that list.
 - Spread tracks across the artists in the pool — do not repeat the same artist back-to-back
+- Keep repetition low across the full list. For playlists longer than 8 tracks, use at most 2 tracks per artist unless the pool is very small.
 - Pick the tracks that best fit the mood from each artist — use their listed starter tracks or other real well-known tracks
+- Balance familiarity and discovery: include some obvious mood anchors and some less-obvious picks that still fit emotionally.
 - The order of tracks should flow naturally for the mood, not follow any particular artist order
 - The playlist should have a poetic, evocative title (examples: "For 3am when the city's quiet", "Soft rain on a Saturday you forgot about", "The kind of love that doesn't ask questions")
 - Each track should have a one-sentence reason written in second person, present tense, poetic and evocative
+
+CANDIDATE TRACKS (pick from these only):
+${candidateContext}
 
 Return EXACTLY this JSON format and nothing else:
 {
@@ -2439,6 +3599,38 @@ Return EXACTLY this JSON format and nothing else:
     if (text) {
       const clean = text.replace(/```json|```/g, '').trim();
       const data = JSON.parse(clean);
+      const used = new Set();
+      data.tracks = (data.tracks || []).filter(t => {
+        if (!t || !t.artist || !t.track) return false;
+        const key = makeTrackKey(t.artist, t.track);
+        if (used.has(key)) return false;
+        used.add(key);
+        return true;
+      });
+      for (const c of candidateTracks) {
+        if (data.tracks.length >= selectedLength) break;
+        const key = makeTrackKey(c.artist_name, c.track_name);
+        if (used.has(key)) continue;
+        data.tracks.push({
+          artist: c.artist_name,
+          track: c.track_name,
+          reason: `you keep this in rotation because it lands right in the ${mood.toLowerCase()} pocket without forcing it.`
+        });
+        used.add(key);
+      }
+      data.tracks = data.tracks.slice(0, selectedLength);
+      if (!data.title) data.title = `${mood.charAt(0).toUpperCase() + mood.slice(1)} — a soft wave`;
+
+      recordRecoEvent('playlist_generate', {
+        mood,
+        source: 'ai',
+        metadata: {
+          pool_size: filteredPool.length,
+          candidate_count: candidateTracks.length,
+          requested_length: selectedLength,
+          context: contextNotes || null
+        }
+      });
       closePlaylistModal();
       renderPlaylistOutput(data, mood);
     } else {
@@ -2446,12 +3638,18 @@ Return EXACTLY this JSON format and nothing else:
     }
   } catch(e) {
     if (e.message === 'no_key' || e.message === 'No API key set' || e.message === 'No OpenRouter key') {
-      // Local fallback — build a playlist from scored artists without AI
-      const pool = [...artistPool].sort(() => Math.random() - 0.5).slice(0, selectedLength);
-      const data = {
-        title: `${mood.charAt(0).toUpperCase() + mood.slice(1)} — a soft wave`,
-        tracks: pool.map(a => ({ artist: a.name, track: a.tracks[0], reason: a.sound }))
-      };
+      // Local fallback — hybrid ranker + exploration.
+      const data = buildLocalPlaylistData(filteredPool, mood, selectedLength, candidateTracks, context);
+      recordRecoEvent('playlist_generate', {
+        mood,
+        source: 'local_hybrid',
+        metadata: {
+          pool_size: filteredPool.length,
+          candidate_count: candidateTracks.length,
+          requested_length: selectedLength,
+          context: contextNotes || null
+        }
+      });
       closePlaylistModal();
       renderPlaylistOutput(data, mood);
     } else {
@@ -2467,10 +3665,16 @@ function renderPlaylistOutput(data, mood) {
   const modal = document.getElementById('playlistOutputModal');
   const inner = document.getElementById('playlistOutputInner');
 
+  if (activePlaylistSession && !activePlaylistSession.closed) {
+    finalizePlaylistSession('replaced_by_new_playlist');
+  }
+
   const tracksHtml = data.tracks.map((t, i) => {
-    const raw = t.artist + ' ' + t.track;
-    const spotifyUrl = `https://open.spotify.com/search/${spotifyQ(raw)}`;
-    const appleMusicUrl = `music://music.apple.com/search?term=${appleQ(raw)}`;
+    const links = trackSearchLinks(t.artist, t.track);
+    const spotifyUrl = links.spotifyUrl;
+    const appleMusicUrl = links.appleUrl;
+    const verifyNote = links.verified ? '' : `<div style="font-size:0.5rem;color:var(--muted);letter-spacing:0.06em;margin-top:0.2rem;">unverified match</div>`;
+    const mismatchBtn = links.verified ? '' : renderTrackMismatchButton(t.artist, t.track, 'playlist_output');
     const artistObj = ARTISTS.find(a => a.name.toLowerCase() === t.artist.toLowerCase());
     const artistLink = artistObj
       ? `<span style="cursor:pointer;color:var(--gold);text-decoration:underline;text-underline-offset:3px;" onclick="closePlaylistOutput();openDetail('${artistObj.id}')">${t.artist}</span>`
@@ -2481,14 +3685,29 @@ function renderPlaylistOutput(data, mood) {
       <div class="ai-track-name">${t.track}</div>
       <div class="ai-track-reason">${t.reason}</div>
       <div class="ai-track-links">
-        <a href="${spotifyUrl}" target="_blank" class="ai-track-link">↗ Spotify</a>
-        <a href="${appleMusicUrl}" class="ai-track-link">↗ Apple Music</a>
+        <a href="${spotifyUrl}" target="_blank" class="ai-track-link rec-track-link" data-source="playlist_output" data-artist="${t.artist.replace(/"/g,'&quot;')}" data-track="${t.track.replace(/"/g,'&quot;')}" title="Strict artist+track search">↗ Spotify</a>
+        <a href="${appleMusicUrl}" class="ai-track-link rec-track-link" data-source="playlist_output" data-artist="${t.artist.replace(/"/g,'&quot;')}" data-track="${t.track.replace(/"/g,'&quot;')}" title="Strict artist+track search">↗ Apple Music</a>
       </div>
+      ${verifyNote}
+      ${mismatchBtn ? `<div style="margin-top:0.2rem;">${mismatchBtn}</div>` : ''}
+      ${renderTrackRatingWidget(t.artist, t.track, 'playlist_output')}
     </div>`;
   }).join('');
 
   const copyText = data.tracks.map((t,i) => `${i+1}. ${t.artist} — ${t.track}`).join('\n');
   lastGeneratedPlaylist = { title: data.title, mood, tracks: data.tracks };
+  startPlaylistSession(data, mood);
+  data.tracks.forEach((t, i) => {
+    const artistId = inferArtistIdByName(t.artist);
+    recordRecoEvent('playlist_impression', {
+      artist_id: artistId,
+      artist_name: t.artist,
+      track_name: t.track,
+      mood,
+      source: 'playlist_output',
+      metadata: { position: i + 1, playlist_title: data.title }
+    });
+  });
   updateChatDownloadBtn();
 
   inner.innerHTML = `
@@ -2512,6 +3731,7 @@ function renderPlaylistOutput(data, mood) {
 }
 
 function closePlaylistOutput() {
+  finalizePlaylistSession('closed_by_user');
   document.getElementById('playlistOutputModal').classList.remove('open');
 }
 
@@ -2528,9 +3748,8 @@ function sharePlaylist() {
   const { title, mood, tracks } = lastGeneratedPlaylist;
   const text = `${title}\n— mood: ${mood} —\n\n` +
     tracks.map((t, i) => {
-      const raw = t.artist + ' ' + t.track;
-      const q = encodeURIComponent(raw);
-      return `${i + 1}. ${t.artist} — ${t.track}\n   ↗ Spotify: https://open.spotify.com/search/${q}\n   ↗ Apple Music: https://music.apple.com/search?term=${appleQ(raw)}`;
+      const links = trackSearchLinks(t.artist, t.track);
+      return `${i + 1}. ${t.artist} — ${t.track}\n   ↗ Spotify: ${links.spotifyUrl}\n   ↗ Apple Music: ${links.appleUrl}`;
     }).join('\n') +
     '\n\nvia The Soft Wave';
   if (navigator.share) {
@@ -2558,12 +3777,11 @@ function downloadPlaylistData(title, mood, tracks) {
     `Mood: ${mood}`,
     '',
     ...tracks.map((t, i) => {
-      const raw = t.artist + ' ' + t.track;
-      const q = encodeURIComponent(raw);
+      const links = trackSearchLinks(t.artist, t.track);
       return [
         `${i + 1}. ${t.artist} — ${t.track}`,
-        `   Spotify: https://open.spotify.com/search/${q}`,
-        `   Apple Music: https://music.apple.com/search?term=${appleQ(raw)}`
+        `   Spotify: ${links.spotifyUrl}`,
+        `   Apple Music: ${links.appleUrl}`
       ].join('\n');
     }),
     '',
@@ -2607,9 +3825,19 @@ async function toggleFavorite(artistId, btn) {
   if (isFav) {
     await _supabase.from('favorites').delete().eq('artist_id', artistId);
     favoriteArtistIds.delete(artistId);
+    recordRecoEvent('favorite_remove', {
+      artist_id: artistId,
+      artist_name: ARTISTS.find(a => a.id === artistId)?.name || null,
+      source: 'artist_card'
+    });
   } else {
     await _supabase.from('favorites').insert({ user_id: session.user.id, artist_id: artistId });
     favoriteArtistIds.add(artistId);
+    recordRecoEvent('favorite_add', {
+      artist_id: artistId,
+      artist_name: ARTISTS.find(a => a.id === artistId)?.name || null,
+      source: 'artist_card'
+    });
   }
   if (btn) btn.classList.toggle('active', !isFav);
 }
@@ -2659,6 +3887,11 @@ async function saveCurrentPlaylist() {
     tracks
   }).select().single();
   if (error) { console.error('saveCurrentPlaylist:', error); return; }
+  recordRecoEvent('playlist_save', {
+    source: 'playlist_output',
+    mood,
+    metadata: { track_count: tracks.length }
+  });
   savedPlaylists.unshift({ id: data.id, title: data.name, mood: data.mood, tracks: data.tracks, savedAt: data.created_at });
   updateSavedCount();
   updateChatDownloadBtn();
@@ -2728,9 +3961,11 @@ function renderPlaylistEditor(id) {
   if (!pl) { renderPlaylistGrid(); return; }
 
   const tracksHtml = pl.tracks.map((t, i) => {
-    const raw = t.artist + ' ' + t.track;
-    const spotifyUrl = `https://open.spotify.com/search/${spotifyQ(raw)}`;
-    const appleUrl = `music://music.apple.com/search?term=${appleQ(raw)}`;
+    const links = trackSearchLinks(t.artist, t.track);
+    const spotifyUrl = links.spotifyUrl;
+    const appleUrl = links.appleUrl;
+    const verifyNote = links.verified ? '' : `<div style="font-size:0.5rem;color:var(--muted);letter-spacing:0.06em;margin-top:0.2rem;">unverified match</div>`;
+    const mismatchBtn = links.verified ? '' : renderTrackMismatchButton(t.artist, t.track, 'saved_playlist_editor');
     return `<div class="editable-track" id="track-row-${id}-${i}">
       <button class="track-remove-btn" onclick="removeTrackFromSaved('${id}',${i})" title="Remove">✕</button>
       <div style="flex:1;">
@@ -2738,9 +3973,11 @@ function renderPlaylistEditor(id) {
         <div style="font-family:'Cormorant Garamond',serif;font-size:1rem;font-weight:500;margin-bottom:0.3rem;">${t.track}</div>
         ${t.reason ? `<div style="font-family:'Cormorant Garamond',serif;font-size:0.85rem;font-style:italic;color:rgba(233,229,223,0.55);line-height:1.5;margin-bottom:0.35rem;">${t.reason}</div>` : ''}
         <div style="display:flex;gap:0.4rem;">
-          <a href="${spotifyUrl}" target="_blank" rel="noopener noreferrer" class="ai-track-link">↗ Spotify</a>
-          <a href="${appleUrl}" class="ai-track-link">↗ Apple Music</a>
+          <a href="${spotifyUrl}" target="_blank" rel="noopener noreferrer" class="ai-track-link" title="Strict artist+track search">↗ Spotify</a>
+          <a href="${appleUrl}" class="ai-track-link" title="Strict artist+track search">↗ Apple Music</a>
         </div>
+        ${verifyNote}
+        ${mismatchBtn ? `<div style="margin-top:0.2rem;">${mismatchBtn}</div>` : ''}
       </div>
     </div>`;
   }).join('');
@@ -2832,14 +4069,33 @@ function spotifyQ(str) {
   return encodeURIComponent(str.replace(/[()[\]]/g, '').replace(/\s+/g, ' ').trim());
 }
 
+function isKnownTrackForArtist(artistName, trackName) {
+  const a = ARTISTS.find(x => normText(x.name) === normText(artistName));
+  if (!a) return false;
+  const t = normText(trackName);
+  return a.tracks.some(k => normText(k) === t);
+}
+
+function trackSearchLinks(artistName, trackName) {
+  const strictSpotify = `artist:"${String(artistName || '').trim()}" track:"${String(trackName || '').trim()}"`;
+  const strictApple = `${String(artistName || '').trim()} ${String(trackName || '').trim()}`;
+  return {
+    spotifyUrl: `https://open.spotify.com/search/${encodeURIComponent(strictSpotify)}`,
+    appleUrl: `https://music.apple.com/search?term=${encodeURIComponent(strictApple)}`,
+    verified: isKnownTrackForArtist(artistName, trackName)
+  };
+}
+
 function renderAiTracks(tracks, containerId, withArtistLink = false) {
   const container = document.getElementById(containerId);
   if (!container) return;
 
   container.innerHTML = `<div class="ai-results">` + tracks.map((t, i) => {
-    const raw = t.artist + ' ' + t.track;
-    const spotifyUrl = `https://open.spotify.com/search/${spotifyQ(raw)}`;
-    const appleMusicUrl = `music://music.apple.com/search?term=${appleQ(raw)}`;
+    const links = trackSearchLinks(t.artist, t.track);
+    const spotifyUrl = links.spotifyUrl;
+    const appleMusicUrl = links.appleUrl;
+    const verifyNote = links.verified ? '' : `<div style="font-size:0.5rem;color:var(--muted);letter-spacing:0.06em;margin-top:0.2rem;">unverified match</div>`;
+    const mismatchBtn = links.verified ? '' : renderTrackMismatchButton(t.artist, t.track, containerId);
     const artistObj = ARTISTS.find(a => a.name.toLowerCase() === t.artist.toLowerCase());
     const artistDisplay = (withArtistLink && artistObj)
       ? `<span style="cursor:pointer;text-decoration:underline;text-underline-offset:3px;" onclick="openDetail('${artistObj.id}')">${t.artist}</span>`
@@ -2850,9 +4106,12 @@ function renderAiTracks(tracks, containerId, withArtistLink = false) {
       <div class="ai-track-name">${t.track}</div>
       <div class="ai-track-reason">${t.reason}</div>
       <div class="ai-track-links">
-        <a href="${spotifyUrl}" target="_blank" class="ai-track-link">↗ Spotify</a>
-        <a href="${appleMusicUrl}" class="ai-track-link">↗ Apple Music</a>
+        <a href="${spotifyUrl}" target="_blank" class="ai-track-link rec-track-link" data-source="${containerId}" data-artist="${t.artist.replace(/"/g,'&quot;')}" data-track="${t.track.replace(/"/g,'&quot;')}" title="Strict artist+track search">↗ Spotify</a>
+        <a href="${appleMusicUrl}" class="ai-track-link rec-track-link" data-source="${containerId}" data-artist="${t.artist.replace(/"/g,'&quot;')}" data-track="${t.track.replace(/"/g,'&quot;')}" title="Strict artist+track search">↗ Apple Music</a>
       </div>
+      ${verifyNote}
+      ${mismatchBtn ? `<div style="margin-top:0.2rem;">${mismatchBtn}</div>` : ''}
+      ${renderTrackRatingWidget(t.artist, t.track, containerId)}
     </div>`;
   }).join('') + `</div>`;
 }
@@ -3196,8 +4455,8 @@ function localChatResponse(msg, history = []) {
 
   // ── Helper: Spotify search link ───────────────────────────
   function spotifyLink(track, artist) {
-    const q = spotifyQ(`${track} ${artist}`);
-    return `<a href="https://open.spotify.com/search/${q}" target="_blank" style="color:var(--green);text-decoration:none;" title="Search on Spotify"><em>"${track}"</em> <span style="font-size:0.75em;">↗</span></a>`;
+    const links = trackSearchLinks(artist, track);
+    return `<a href="${links.spotifyUrl}" target="_blank" style="color:var(--green);text-decoration:none;" title="Strict artist+track search"><em>"${track}"</em> <span style="font-size:0.75em;">↗</span></a>`;
   }
 
   // ── Helper: pick best track for the requested mood ────────────
@@ -3563,6 +4822,8 @@ Music rules:
 - If someone asks for a playlist of N songs, give exactly N tracks — no matter how large. Never cut it short.
 - Always mention at least one specific track and why it fits the mood
 - Use your own knowledge of what track best fits the requested mood — don't just default to the most popular song
+- Keep repetition low: avoid repeating the same artist or same obvious songs unless the user explicitly asks for that artist.
+- Mix known anchors with deeper cuts when possible, as long as mood fit stays strong.
 - If you don't know enough about something, say so honestly
 - If someone's message is vague — just "sad", "chill vibes", "something good" — do NOT flood them with recs. Ask ONE specific follow-up to get more texture before recommending. Something like "what kind of sad? numb and hollow, or full-on crying in the car?" or "what's the setting — late night alone, daytime, driving?"
 - The more specific a person's description, the more precise your picks should be. Match the texture of what they give you.${lastGeneratedPlaylist ? `
@@ -3703,6 +4964,24 @@ Only include real, actual tracks that this artist has released. If unsure, use t
 
 // Show API key modal on load (don't render grid until key is set)
 // renderAll() is called after key is entered
+document.addEventListener('click', (evt) => {
+  const link = evt.target.closest('.rec-track-link');
+  if (!link) return;
+  const artist = link.getAttribute('data-artist') || '';
+  const track = link.getAttribute('data-track') || '';
+  const source = link.getAttribute('data-source') || 'link';
+  if (!artist || !track) return;
+  if (source === 'playlist_output') markPlaylistTrackOpen(artist, track);
+  const href = String(link.getAttribute('href') || '');
+  const provider = href.includes('spotify') ? 'spotify' : (href.includes('apple') || href.startsWith('music://') ? 'apple' : 'unknown');
+  recordRecoEvent('track_open', {
+    artist_id: inferArtistIdByName(artist),
+    artist_name: artist,
+    track_name: track,
+    source,
+    metadata: { provider }
+  });
+});
 // ============================================================
 // SUPABASE AUTH
 // ============================================================
@@ -3710,8 +4989,15 @@ Only include real, actual tracks that this artist has released. If unsure, use t
 // ⚠ Replace these two values with your own Supabase project credentials:
 // Project URL → Supabase dashboard > Project Settings > API
 // Anon key   → same page, under "Project API keys"
-const SUPABASE_URL  = 'https://siljqirgrnciulimzawg.supabase.co';
-const SUPABASE_ANON = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InNpbGpxaXJncm5jaXVsaW16YXdnIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzYzMTgxNjIsImV4cCI6MjA5MTg5NDE2Mn0.hHzXGMxs7ONAPNYEV2Ed9sSqLl8v41VUK7PLgWa3hIs';
+const SUPABASE_URL  = 'https://mbecdcimfjodnjihfmwz.supabase.co';
+const SUPABASE_ANON = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im1iZWNkY2ltZmpvZG5qaWhmbXd6Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODA5MjUzNTMsImV4cCI6MjA5NjUwMTM1M30.Mn-KVgykyn1YJVQlx-LZk-Vf6wimPMDmfQ2ElMsdztQ';
+
+if (SUPABASE_ANON === 'PASTE_NEW_SUPABASE_ANON_KEY_HERE') {
+  console.error('Supabase anon key is still a placeholder. Update SUPABASE_ANON in this file.');
+  setTimeout(() => {
+    alert('Supabase is not configured yet. Paste your new anon key into SUPABASE_ANON in the-soft-wave.html.');
+  }, 0);
+}
 
 const _supabase = supabase.createClient(SUPABASE_URL, SUPABASE_ANON);
 
@@ -3722,6 +5008,15 @@ function showAuthOverlay() {
 function hideAuthOverlay() {
   document.getElementById('authOverlay').style.display = 'none';
   document.getElementById('mainApp').style.display = '';
+}
+
+function applySharedProxyModeUI() {
+  if (!USE_SHARED_PROXY) return;
+  const modal = document.getElementById('apikeyModal');
+  if (modal) modal.style.display = 'none';
+  document.querySelectorAll('[onclick="openApiKeyModal()"]').forEach(el => {
+    el.style.display = 'none';
+  });
 }
 function showLogin() {
   document.getElementById('loginForm').style.display = '';
@@ -3777,6 +5072,8 @@ async function signUp() {
 }
 
 async function signOut() {
+  finalizePlaylistSession('manual_signout');
+  await flushQualityMetrics('signout');
   await _supabase.auth.signOut();
 }
 
@@ -3785,8 +5082,13 @@ _supabase.auth.onAuthStateChange((event, session) => {
   console.log('auth state change:', event, session);
   if (session) {
     hideAuthOverlay();
+    applySharedProxyModeUI();
+    loadRecoModelConfig();
+    ensureQualityFlushTimer();
+    loadAccountApiKey();
     loadSavedPlaylists();
     loadFavorites().then(() => renderGrid());
+    loadTrackRatings();
     loadChatHistory();
     // Add sign-out button and username to header if not already there
     if (!document.getElementById('signOutBtn')) {
@@ -3808,8 +5110,15 @@ _supabase.auth.onAuthStateChange((event, session) => {
       }
     }
   } else {
+    finalizePlaylistSession('session_ended');
+    flushQualityMetrics('session_ended');
+    stopQualityFlushTimer();
     showAuthOverlay();
+    GEMINI_API_KEY = '';
+    OPENROUTER_KEY = '';
+    recoModel = JSON.parse(JSON.stringify(DEFAULT_RECO_MODEL));
     favoriteArtistIds = new Set();
+    Object.keys(trackRatingMap).forEach(k => delete trackRatingMap[k]);
     renderGrid();
     document.getElementById('chatMessages').innerHTML = '';
     chatHistory = [];
@@ -3818,6 +5127,17 @@ _supabase.auth.onAuthStateChange((event, session) => {
     const nameEl = document.getElementById('headerUsername');
     if (nameEl) nameEl.remove();
   }
+});
+
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) {
+    flushQualityMetrics('visibility_hidden');
+  }
+});
+
+window.addEventListener('pagehide', () => {
+  finalizePlaylistSession('pagehide');
+  flushQualityMetrics('pagehide');
 });
 
 updateSavedCount();
