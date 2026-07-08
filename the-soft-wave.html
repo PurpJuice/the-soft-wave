@@ -1272,6 +1272,46 @@
     border-top: 1px solid var(--border);
   }
 
+  .chat-feedback-bar {
+    display: flex;
+    align-items: center;
+    gap: 0.45rem;
+    flex-wrap: wrap;
+    margin-top: 0.5rem;
+    padding-top: 0.55rem;
+    border-top: 1px solid var(--border);
+  }
+
+  .chat-feedback-label {
+    font-size: 0.52rem;
+    color: var(--muted);
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+  }
+
+  .learned-row {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 0.75rem;
+    padding: 0.55rem 0;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .learned-text {
+    font-size: 0.68rem;
+    color: rgba(233,229,223,0.9);
+    line-height: 1.45;
+  }
+
+  .learned-meta {
+    font-size: 0.52rem;
+    color: var(--muted);
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    margin-top: 0.18rem;
+  }
+
   /* PLAYLIST MANAGER */
   .playlist-manager-modal {
     position: fixed;
@@ -1553,6 +1593,11 @@
   <div class="playlist-output-inner" id="playlistManagerInner"></div>
 </div>
 
+<!-- LEARNED PATTERNS MODAL -->
+<div class="playlist-manager-modal" id="learnedPatternModal">
+  <div class="playlist-output-inner" id="learnedPatternInner"></div>
+</div>
+
 <!-- CHAT -->
 <button class="chat-btn" id="chatBtn" onclick="toggleChat()">
   <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
@@ -1564,6 +1609,7 @@
   <div class="chat-header">
     <div class="chat-title">Discovery Chat</div>
     <div style="display:flex;align-items:center;gap:0.5rem;">
+      <button class="chat-quick-btn" id="chatLearnedBtn" onclick="openLearnedPatternPanel()" style="font-size:0.55rem;padding:0.28rem 0.65rem;">Learned</button>
       <button class="chat-quick-btn" id="chatDownloadBtn" onclick="openPlaylistManager()" style="display:none;font-size:0.55rem;padding:0.28rem 0.65rem;border-color:rgba(201,169,127,0.4);color:var(--gold)" title="My saved playlists">My Playlists</button>
       <button class="detail-close" style="position:static;" onclick="toggleChat()">✕</button>
     </div>
@@ -1747,6 +1793,7 @@ let selectedArtistIds = null;
 let favoriteArtistIds = new Set();
 let poolSearchQuery = '';
 const chatSaveableMessages = {};
+const chatFeedbackStore = {};
 /** @type {ChatMessage[]} */
 let chatHistory = [];
 let activeArtistId = null;
@@ -1757,12 +1804,36 @@ let lastGeneratedPlaylist = null;
 // USER PROFILE — persisted in localStorage
 // ============================================================
 
+function createEmptyUserProfile() {
+  return {
+    artistInterests: {},
+    moodHistory: {},
+    sessionCount: 0,
+    lastVisit: null,
+    patternExamples: [],
+    tokenMoodWeights: {}
+  };
+}
+
+function normalizeUserProfile(raw) {
+  const base = createEmptyUserProfile();
+  if (!raw || typeof raw !== 'object') return base;
+  return {
+    artistInterests: (raw.artistInterests && typeof raw.artistInterests === 'object') ? raw.artistInterests : {},
+    moodHistory: (raw.moodHistory && typeof raw.moodHistory === 'object') ? raw.moodHistory : {},
+    sessionCount: Number.isFinite(Number(raw.sessionCount)) ? Number(raw.sessionCount) : 0,
+    lastVisit: raw.lastVisit || null,
+    patternExamples: Array.isArray(raw.patternExamples) ? raw.patternExamples.slice(0, 80) : [],
+    tokenMoodWeights: (raw.tokenMoodWeights && typeof raw.tokenMoodWeights === 'object') ? raw.tokenMoodWeights : {}
+  };
+}
+
 function loadUserProfile() {
   try {
     const raw = localStorage.getItem('tsw_profile');
-    if (raw) return JSON.parse(raw);
+    if (raw) return normalizeUserProfile(JSON.parse(raw));
   } catch(e) {}
-  return { artistInterests: {}, moodHistory: {}, sessionCount: 0, lastVisit: null };
+  return createEmptyUserProfile();
 }
 
 function saveUserProfile() {
@@ -1799,7 +1870,320 @@ function topProfileMood() {
   return entries.sort((a, b) => b[1] - a[1])[0][0];
 }
 
-/** @type {{ artistInterests: Object.<string,number>, moodHistory: Object.<string,number>, sessionCount: number, lastVisit: string|null }} */
+const LEARNED_PATTERN_STOP = new Set([
+  'the','and','with','for','that','this','what','when','where','how','about','into','from','have','been',
+  'just','very','really','still','want','wanna','your','youre','they','them','their','there','im','ive',
+  'dont','doesnt','didnt','cant','wont','its','like','music','song','songs','track','tracks','artist','artists'
+]);
+
+const BASE_MOOD_PATTERNS = [
+  { mood: 'melancholic', test: /sad|heartbreak|broken|grief|cry|down|hurt/ },
+  { mood: 'late night', test: /late\s*night|2am|3am|midnight|cant\s*sleep|insomnia/ },
+  { mood: 'warm', test: /warm|sunday|morning|coffee|soft|calm|unwind/ },
+  { mood: 'dark', test: /dark|heavy|brooding|angry|moody/ },
+  { mood: 'romantic', test: /romantic|in\s*love|tender|desire|open\s*heart/ },
+  { mood: 'healing', test: /closure|at\s*peace|doesn'?t\s*hurt|letting\s*go|acceptance|moved\s*on|open\s*hands/ },
+  { mood: 'introspective', test: /reflect|thinking|introspect|processing|self|journal/ },
+  { mood: 'spiritual', test: /spiritual|grateful|hopeful|pray|faith/ },
+  { mood: 'groovy', test: /happy|joy|uplift|good\s*energy|hype/ }
+];
+
+function detectMoodsFromBasePatterns(text) {
+  const lower = normText(text);
+  const moods = new Set();
+  for (const p of BASE_MOOD_PATTERNS) {
+    if (p.test.test(lower)) moods.add(p.mood);
+  }
+  return [...moods];
+}
+
+function trimTokenMoodWeights(maxTokens = 500) {
+  const entries = Object.entries(userProfile.tokenMoodWeights || {}).map(([tok, scores]) => {
+    const total = Object.values(scores || {}).reduce((a, b) => a + Number(b || 0), 0);
+    return { tok, scores, total };
+  });
+  if (entries.length <= maxTokens) return;
+  entries.sort((a, b) => b.total - a.total);
+  const keep = new Set(entries.slice(0, maxTokens).map(e => e.tok));
+  Object.keys(userProfile.tokenMoodWeights).forEach(tok => {
+    if (!keep.has(tok)) delete userProfile.tokenMoodWeights[tok];
+  });
+}
+
+function learnFromUserExample(text) {
+  const moods = detectMoodsFromBasePatterns(text);
+  if (!moods.length) return;
+
+  for (const mood of moods) {
+    updateUserProfile(null, mood);
+  }
+
+  const tokens = tokenize(text).filter(t => t.length >= 3 && !LEARNED_PATTERN_STOP.has(t));
+  if (!userProfile.tokenMoodWeights || typeof userProfile.tokenMoodWeights !== 'object') {
+    userProfile.tokenMoodWeights = {};
+  }
+
+  for (const tok of tokens) {
+    if (!userProfile.tokenMoodWeights[tok]) userProfile.tokenMoodWeights[tok] = {};
+    for (const mood of moods) {
+      userProfile.tokenMoodWeights[tok][mood] = (userProfile.tokenMoodWeights[tok][mood] || 0) + 1;
+    }
+  }
+
+  if (!Array.isArray(userProfile.patternExamples)) userProfile.patternExamples = [];
+  userProfile.patternExamples.unshift({
+    text: String(text || '').slice(0, 220),
+    moods,
+    at: new Date().toISOString()
+  });
+  userProfile.patternExamples = userProfile.patternExamples.slice(0, 60);
+
+  trimTokenMoodWeights(500);
+  saveUserProfile();
+}
+
+function inferLearnedMoods(text) {
+  const tokens = tokenize(text).filter(t => t.length >= 3);
+  if (!tokens.length) return [];
+  const scores = {};
+
+  for (const tok of tokens) {
+    const moodScores = userProfile.tokenMoodWeights?.[tok];
+    if (!moodScores) continue;
+    for (const [mood, val] of Object.entries(moodScores)) {
+      scores[mood] = (scores[mood] || 0) + Number(val || 0);
+    }
+  }
+
+  return Object.entries(scores)
+    .filter(([, score]) => score >= 2)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 3)
+    .map(([mood]) => mood);
+}
+
+function buildLearnedPatternPrompt() {
+  const examples = Array.isArray(userProfile.patternExamples) ? userProfile.patternExamples.slice(0, 6) : [];
+  const moodCounts = Object.entries(userProfile.moodHistory || {})
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 5)
+    .map(([m, c]) => `${m}(${c})`)
+    .join(', ');
+
+  const lines = examples.map((ex, i) => `${i + 1}. "${String(ex.text || '').replace(/"/g, '\\"')}" -> ${Array.isArray(ex.moods) ? ex.moods.join('/') : ''}`);
+  if (!moodCounts && !lines.length) return '';
+
+  return `\n\nUser-learned pattern memory (adapt your recs to this):\nTop learned moods: ${moodCounts || 'none yet'}\nExamples:\n${lines.join('\n') || 'none yet'}`;
+}
+
+const MOOD_ALIASES = {
+  closure: 'healing',
+  peace: 'healing',
+  acceptance: 'healing',
+  calm: 'warm',
+  cozy: 'warm',
+  heartbreak: 'melancholic',
+  sad: 'melancholic',
+  romance: 'romantic',
+  love: 'romantic',
+  deep: 'introspective',
+  reflection: 'introspective',
+  spiritual: 'spiritual',
+  dark: 'dark',
+  midnight: 'late night',
+  night: 'late night',
+  groove: 'groovy',
+  happy: 'groovy'
+};
+
+function normalizeMoodLabel(value) {
+  const raw = normText(value);
+  if (!raw) return '';
+  if (MOOD_ALIASES[raw]) return MOOD_ALIASES[raw];
+  return raw;
+}
+
+function inferMoodsForText(text) {
+  const base = detectMoodsFromBasePatterns(text);
+  const learned = inferLearnedMoods(text);
+  const merged = [...new Set([...base, ...learned].map(normalizeMoodLabel).filter(Boolean))];
+  return merged.slice(0, 4);
+}
+
+function reinforceLearningForText(text, moods, strength = 1) {
+  const cleanMoods = [...new Set((moods || []).map(normalizeMoodLabel).filter(Boolean))];
+  if (!cleanMoods.length) return;
+  const tokens = tokenize(text).filter(t => t.length >= 3 && !LEARNED_PATTERN_STOP.has(t));
+  if (!userProfile.tokenMoodWeights || typeof userProfile.tokenMoodWeights !== 'object') {
+    userProfile.tokenMoodWeights = {};
+  }
+  for (const tok of tokens) {
+    if (!userProfile.tokenMoodWeights[tok]) userProfile.tokenMoodWeights[tok] = {};
+    for (const mood of cleanMoods) {
+      userProfile.tokenMoodWeights[tok][mood] = (userProfile.tokenMoodWeights[tok][mood] || 0) + strength;
+    }
+  }
+  for (const mood of cleanMoods) {
+    userProfile.moodHistory[mood] = (userProfile.moodHistory[mood] || 0) + strength;
+  }
+  userProfile.patternExamples.unshift({
+    text: String(text || '').slice(0, 220),
+    moods: cleanMoods,
+    at: new Date().toISOString()
+  });
+  userProfile.patternExamples = userProfile.patternExamples.slice(0, 60);
+  trimTokenMoodWeights(500);
+  saveUserProfile();
+}
+
+function reduceLearningForText(text, moods, amount = 1) {
+  const cleanMoods = [...new Set((moods || []).map(normalizeMoodLabel).filter(Boolean))];
+  if (!cleanMoods.length) return;
+  const tokens = tokenize(text).filter(t => t.length >= 3 && !LEARNED_PATTERN_STOP.has(t));
+  for (const tok of tokens) {
+    const bucket = userProfile.tokenMoodWeights?.[tok];
+    if (!bucket) continue;
+    for (const mood of cleanMoods) {
+      if (!bucket[mood]) continue;
+      bucket[mood] = Math.max(0, bucket[mood] - amount);
+      if (bucket[mood] === 0) delete bucket[mood];
+    }
+    if (!Object.keys(bucket).length) delete userProfile.tokenMoodWeights[tok];
+  }
+  saveUserProfile();
+}
+
+function registerChatFeedbackContext(userText, aiText) {
+  const id = `fb_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+  chatFeedbackStore[id] = {
+    userText: String(userText || ''),
+    aiText: String(aiText || ''),
+    inferredMoods: inferMoodsForText(userText)
+  };
+  return id;
+}
+
+function renderChatFeedbackBar(feedbackId) {
+  return `<div class="chat-feedback-bar" id="feedback-${feedbackId}">` +
+    `<span class="chat-feedback-label">Train this result</span>` +
+    `<button class="chat-quick-btn" style="font-size:0.52rem;padding:0.24rem 0.52rem;" onclick="chatFeedbackMatched('${feedbackId}')">This matched</button>` +
+    `<button class="chat-quick-btn" style="font-size:0.52rem;padding:0.24rem 0.52rem;" onclick="chatFeedbackCorrect('${feedbackId}')">Not what I meant</button>` +
+    `</div>`;
+}
+
+function chatFeedbackMatched(id) {
+  const sample = chatFeedbackStore[id];
+  if (!sample) return;
+  const moods = sample.inferredMoods.length ? sample.inferredMoods : [topProfileMood() || 'introspective'];
+  reinforceLearningForText(sample.userText, moods, 2);
+  const bar = document.getElementById(`feedback-${id}`);
+  if (bar) bar.innerHTML = `<span class="chat-feedback-label" style="color:var(--green);">Saved as a matched example</span>`;
+  showTooltip('Learned from this match ✓');
+}
+
+function chatFeedbackCorrect(id) {
+  const sample = chatFeedbackStore[id];
+  if (!sample) return;
+  const suggested = sample.inferredMoods.join(', ');
+  const answer = prompt(`What mood should this have mapped to?\nUse one or more, comma-separated.\nExample: healing, warm, introspective`, suggested || '');
+  if (answer === null) return;
+
+  const corrected = answer
+    .split(',')
+    .map(v => normalizeMoodLabel(v))
+    .filter(Boolean);
+
+  if (!corrected.length) {
+    showTooltip('No mood entered');
+    return;
+  }
+
+  if (sample.inferredMoods.length) {
+    reduceLearningForText(sample.userText, sample.inferredMoods, 1);
+  }
+  reinforceLearningForText(sample.userText, corrected, 3);
+
+  const bar = document.getElementById(`feedback-${id}`);
+  if (bar) {
+    bar.innerHTML = `<span class="chat-feedback-label" style="color:var(--gold);">Adjusted to: ${corrected.join(', ')}</span>`;
+  }
+  showTooltip('Updated learning from your correction ✓');
+}
+
+function openLearnedPatternPanel() {
+  renderLearnedPatternPanel();
+  document.getElementById('learnedPatternModal').classList.add('open');
+}
+
+function closeLearnedPatternPanel() {
+  document.getElementById('learnedPatternModal').classList.remove('open');
+}
+
+function clearLearnedPatterns() {
+  const ok = confirm('Clear all learned mood patterns and examples?');
+  if (!ok) return;
+  userProfile.patternExamples = [];
+  userProfile.tokenMoodWeights = {};
+  userProfile.moodHistory = {};
+  saveUserProfile();
+  renderLearnedPatternPanel();
+  showTooltip('Learned patterns cleared');
+}
+
+function removeLearnedExample(index) {
+  if (!Array.isArray(userProfile.patternExamples)) return;
+  userProfile.patternExamples.splice(index, 1);
+  saveUserProfile();
+  renderLearnedPatternPanel();
+}
+
+function renderLearnedPatternPanel() {
+  const inner = document.getElementById('learnedPatternInner');
+  if (!inner) return;
+
+  const moods = Object.entries(userProfile.moodHistory || {})
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 8);
+  const examples = Array.isArray(userProfile.patternExamples) ? userProfile.patternExamples.slice(0, 20) : [];
+
+  const moodHtml = moods.length
+    ? moods.map(([m, c]) => `<span class="artist-chip" style="margin:0 0.35rem 0.35rem 0;">${m} · ${c}</span>`).join('')
+    : '<div style="font-size:0.65rem;color:var(--muted);">No learned moods yet. Start chatting and use feedback buttons.</div>';
+
+  const exHtml = examples.length
+    ? examples.map((ex, i) => `<div class="learned-row">
+        <div style="flex:1;min-width:0;">
+          <div class="learned-text">${escapeHtml(ex.text || '')}</div>
+          <div class="learned-meta">${escapeHtml((ex.moods || []).join(', ')) || 'unlabeled'} · ${new Date(ex.at || Date.now()).toLocaleDateString()}</div>
+        </div>
+        <button class="btn" style="font-size:0.52rem;padding:0.22rem 0.5rem;color:var(--muted);" onclick="removeLearnedExample(${i})">Remove</button>
+      </div>`).join('')
+    : '<div style="font-size:0.65rem;color:var(--muted);">No saved examples yet.</div>';
+
+  inner.innerHTML = `
+    <div class="manager-back-bar">
+      <div>
+        <div class="playlist-eyebrow">The Soft Wave · Adaptive Learning</div>
+        <div class="playlist-title" style="font-size:1.8rem;">Learned Patterns</div>
+      </div>
+      <div style="display:flex;gap:0.5rem;">
+        <button class="btn" onclick="clearLearnedPatterns()">Clear all</button>
+        <button class="btn" onclick="closeLearnedPatternPanel()">Close</button>
+      </div>
+    </div>
+    <div style="margin-bottom:1.2rem;">
+      <div class="playlist-eyebrow" style="margin-bottom:0.35rem;">Top Learned Moods</div>
+      <div>${moodHtml}</div>
+    </div>
+    <div>
+      <div class="playlist-eyebrow" style="margin-bottom:0.35rem;">Recent Training Examples</div>
+      ${exHtml}
+    </div>
+    <div style="height:2rem;"></div>
+  `;
+}
+
+/** @type {{ artistInterests: Object.<string,number>, moodHistory: Object.<string,number>, sessionCount: number, lastVisit: string|null, patternExamples: {text:string,moods:string[],at:string}[], tokenMoodWeights: Object.<string,Object.<string,number>> }} */
 let userProfile = loadUserProfile();
 // Increment session count on load
 userProfile.sessionCount = (userProfile.sessionCount || 0) + 1;
@@ -3396,11 +3780,18 @@ function extractTracksFromChatHTML(html) {
     if (seen.has(decoded)) continue;
     seen.add(decoded);
     let artist = '', track = decoded;
+    const strict = decoded.match(/artist:\"([^\"]+)\"\s*track:\"([^\"]+)\"/i);
+    if (strict) {
+      artist = strict[1].trim();
+      track = strict[2].trim();
+    }
     // Try artist-first (AI format: "Artist Track")
-    for (const a of ARTISTS) {
-      const dl = decoded.toLowerCase();
-      const al = a.name.toLowerCase();
-      if (dl.startsWith(al + ' ')) { artist = a.name; track = decoded.slice(a.name.length).trim(); break; }
+    if (!artist) {
+      for (const a of ARTISTS) {
+        const dl = decoded.toLowerCase();
+        const al = a.name.toLowerCase();
+        if (dl.startsWith(al + ' ')) { artist = a.name; track = decoded.slice(a.name.length).trim(); break; }
+      }
     }
     // Try track-first (local format: "Track Artist")
     if (!artist) {
@@ -4086,6 +4477,91 @@ function trackSearchLinks(artistName, trackName) {
   };
 }
 
+function escapeHtml(str) {
+  return String(str || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function parseChatRecommendations(text) {
+  const clean = String(text || '')
+    .replace(/<[^>]*>/g, '')
+    .replace(/\r/g, '')
+    .trim();
+  if (!clean) return [];
+
+  const lines = clean.split('\n').map(l => l.trim()).filter(Boolean);
+  const picks = [];
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const m = line.match(/^\s*(\d+)\s*[.)-]?\s*([^\-\u2013\u2014]+?)\s*[\u2013\u2014-]\s*([^\|\n]+?)(?:\s*\|\s*(.+))?\s*$/);
+    if (!m) continue;
+
+    const idx = Number(m[1]) || (picks.length + 1);
+    let artist = m[2].trim();
+    let track = m[3].trim().replace(/^"|"$/g, '');
+    let reason = (m[4] || '').trim();
+
+    if (!reason && lines[i + 1]) {
+      const next = lines[i + 1];
+      const rm = next.match(/^(?:why(?: this fits)?|reason)\s*:\s*(.+)$/i);
+      if (rm) {
+        reason = rm[1].trim();
+        i += 1;
+      }
+    }
+
+    const knownArtist = ARTISTS.find(a => normText(a.name) === normText(artist));
+    if (knownArtist) {
+      artist = knownArtist.name;
+      const exact = knownArtist.tracks.find(t => normText(t) === normText(track));
+      if (exact) {
+        track = exact;
+      }
+    }
+
+    picks.push({ index: idx, artist, track, reason });
+  }
+
+  return picks;
+}
+
+function renderChatRecommendationCards(text, source = 'discovery_chat') {
+  const picks = parseChatRecommendations(text);
+  if (!picks.length) return null;
+
+  const cards = picks.map((p, i) => {
+    const links = trackSearchLinks(p.artist, p.track);
+    const whyId = `chat-why-${Date.now()}-${i}`;
+    const whyText = p.reason || 'This pick was selected for your described mood and emotional texture.';
+    const verifyNote = links.verified ? '' : `<div style="font-size:0.5rem;color:var(--muted);letter-spacing:0.06em;margin-top:0.2rem;">unverified match</div>`;
+    return `<div class="ai-track-card fade-in" style="animation-delay:${i * 0.04}s;margin-top:0.45rem;">
+      <div class="ai-track-artist">${p.index}. ${escapeHtml(p.artist)}</div>
+      <div class="ai-track-name">${escapeHtml(p.track)}</div>
+      <div class="ai-track-links">
+        <a href="${links.spotifyUrl}" target="_blank" rel="noopener noreferrer" class="ai-track-link rec-track-link" data-source="${source}" data-artist="${escapeHtml(p.artist)}" data-track="${escapeHtml(p.track)}" title="Strict artist+track search">↗ Spotify</a>
+        <a href="${links.appleUrl}" target="_blank" rel="noopener noreferrer" class="ai-track-link rec-track-link" data-source="${source}" data-artist="${escapeHtml(p.artist)}" data-track="${escapeHtml(p.track)}" title="Strict artist+track search">↗ Apple Music</a>
+      </div>
+      <button class="chat-quick-btn" style="margin-top:0.35rem;font-size:0.52rem;" onclick="toggleWhyReason('${whyId}')">Why this fits</button>
+      <div id="${whyId}" style="display:none;margin-top:0.35rem;font-size:0.66rem;line-height:1.5;color:rgba(233,229,223,0.82);">${escapeHtml(whyText)}</div>
+      ${verifyNote}
+      ${renderTrackRatingWidget(p.artist, p.track, source)}
+    </div>`;
+  }).join('');
+
+  return `<div class="ai-results">${cards}</div>`;
+}
+
+function toggleWhyReason(id) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  el.style.display = el.style.display === 'none' ? 'block' : 'none';
+}
+
 function renderAiTracks(tracks, containerId, withArtistLink = false) {
   const container = document.getElementById(containerId);
   if (!container) return;
@@ -4183,7 +4659,9 @@ function localChatResponse(msg, history = []) {
 
   // ── "Reset / forget me" ───────────────────────────────────
   if (/forget.*me|reset.*my|clear.*my.*history|start.*over|fresh start/.test(lower)) {
-    userProfile = { artistInterests: {}, moodHistory: {}, sessionCount: 1, lastVisit: new Date().toISOString() };
+    userProfile = createEmptyUserProfile();
+    userProfile.sessionCount = 1;
+    userProfile.lastVisit = new Date().toISOString();
     saveUserProfile();
     return "done — clean slate. what are we listening to?";
   }
@@ -4271,6 +4749,7 @@ function localChatResponse(msg, history = []) {
     { test: /chill|relax|calm\s*down|unwind|sunday|morning|coffee/, mood: 'warm' },
     { test: /spiritual|pray|hopeful|grateful|thankful|uplift/, mood: 'spiritual' },
     { test: /creative|focus|work|study|zone\s*in/, mood: 'introspective' },
+    { test: /closure|at\s*peace|peaceful|it\s*doesn'?t\s*hurt|does\s*not\s*hurt|open\s*hands|if\s*they\s*come\s*back|letting\s*them\s*in|moved\s*on\s*but\s*open/, mood: 'healing' },
   ];
 
   // ── Number detection (e.g. "10 songs", "5 tracks") ────────
@@ -4305,7 +4784,26 @@ function localChatResponse(msg, history = []) {
     'dreamy':     'dreamy',
     'raw':        'raw',
     'intimate':   'intimate',
+    'closure':    'healing',
+    'peace':      'healing',
+    'at peace':   'healing',
+    'acceptance': 'healing',
+    'open heart': 'romantic',
+    'letting go': 'healing',
   };
+
+  const closureState = /closure|at\s*peace|peaceful|it\s*doesn'?t\s*hurt|open\s*hands|still\s*open|letting\s*them\s*in|if\s*they\s*come\s*to\s*me|moved\s*on\s*but/.test(lower);
+  if (closureState) {
+    const picks = [
+      { artist: 'Daniel Caesar', track: 'Blessed', why: 'you have accepted what happened, and now love feels like grace instead of survival.' },
+      { artist: 'Sade', track: 'By Your Side', why: 'you are steady and soft at the same time, open but no longer aching.' },
+      { artist: 'Frank Ocean', track: 'Self Control', why: 'you hold the memory without letting it control your peace anymore.' },
+      { artist: 'Snoh Aalegra', track: 'I Want You Around', why: 'you welcome connection, but you are not bargaining for it.' },
+      { artist: 'H.E.R.', track: 'Focus', why: 'you are calm enough to ask for intention, not just attention.' },
+    ];
+    return `this sounds like peaceful closure with an open heart. these fit that exact feeling:<br><br>` +
+      picks.map((p, i) => `${i + 1}. <strong>${p.artist}</strong> — ${spotifyLink(p.track, p.artist)}<br><span style="color:var(--muted);font-size:0.86em;">why this fits: ${p.why}</span>`).join('<br><br>');
+  }
 
   // Collect all moods the user is expressing (multi-mood support)
   const detectedMoods = new Set();
@@ -4317,6 +4815,10 @@ function localChatResponse(msg, history = []) {
   // From direct mood keywords
   for (const [kw, mood] of Object.entries(directMoodMap)) {
     if (lower.includes(kw)) detectedMoods.add(mood);
+  }
+  // From learned examples over time
+  for (const mood of inferLearnedMoods(lower)) {
+    detectedMoods.add(mood);
   }
 
   if (detectedMoods.size > 0) {
@@ -4456,7 +4958,10 @@ function localChatResponse(msg, history = []) {
   // ── Helper: Spotify search link ───────────────────────────
   function spotifyLink(track, artist) {
     const links = trackSearchLinks(artist, track);
-    return `<a href="${links.spotifyUrl}" target="_blank" style="color:var(--green);text-decoration:none;" title="Strict artist+track search"><em>"${track}"</em> <span style="font-size:0.75em;">↗</span></a>`;
+    return `<span class="ai-track-links" style="display:inline-flex;gap:0.35rem;vertical-align:middle;">` +
+      `<a href="${links.spotifyUrl}" target="_blank" rel="noopener noreferrer" class="ai-track-link rec-track-link" data-source="local_chat" data-artist="${artist.replace(/"/g,'&quot;')}" data-track="${track.replace(/"/g,'&quot;')}" title="Strict artist+track search"><em>"${track}"</em> ↗ Spotify</a>` +
+      `<a href="${links.appleUrl}" target="_blank" rel="noopener noreferrer" class="ai-track-link rec-track-link" data-source="local_chat" data-artist="${artist.replace(/"/g,'&quot;')}" data-track="${track.replace(/"/g,'&quot;')}" title="Strict artist+track search">↗ Apple Music</a>` +
+      `</span>`;
   }
 
   // ── Helper: pick best track for the requested mood ────────────
@@ -4687,6 +5192,9 @@ async function sendChat() {
   const msg = input.value.trim();
   if (!msg) return;
 
+  // Learn user language patterns continuously from each example-like message.
+  learnFromUserExample(msg);
+
   input.value = '';
   appendChatMsg('user', msg);
   chatHistory.push({ role: 'user', text: msg });
@@ -4757,10 +5265,27 @@ async function sendChat() {
     return out;
   };
 
+  const formatDiscoveryReply = (reply) => {
+    const cards = renderChatRecommendationCards(reply, 'discovery_chat');
+    if (cards) {
+      const stripped = String(reply || '')
+        .replace(/\r/g, '')
+        .split('\n')
+        .filter(line => !/^\s*\d+\s*[.)-]?\s*[^\n]+[\u2013\u2014-][^\n]+$/.test(line.trim()))
+        .filter(line => !/^(?:why(?: this fits)?|reason)\s*:/i.test(line.trim()))
+        .filter(line => !/^https?:\/\//i.test(line.trim()))
+        .join('\n')
+        .trim();
+      const intro = stripped ? `<div style="margin-bottom:0.35rem;">${linkifyReply(stripped)}</div>` : '';
+      return `${intro}${cards}`;
+    }
+    return linkifyReply(reply);
+  };
+
   const finishReply = (reply, skipLinkify = false) => {
     const loadingEl = document.getElementById(loadingId);
     if (loadingEl) {
-      loadingEl.innerHTML = skipLinkify ? reply : linkifyReply(reply);
+      loadingEl.innerHTML = skipLinkify ? reply : formatDiscoveryReply(reply);
       // Detect responses with 3+ tracks and offer save-as-playlist
       const tracks = extractTracksFromChatHTML(loadingEl.innerHTML);
       if (tracks.length >= 3) {
@@ -4773,6 +5298,11 @@ async function sendChat() {
           `<button class="chat-quick-btn" style="color:var(--gold);border-color:rgba(201,169,127,0.4);font-size:0.55rem;" onclick="expandChatSaveBar('${saveId}')">✶ Save as playlist</button>`;
         loadingEl.appendChild(bar);
       }
+
+      const feedbackId = registerChatFeedbackContext(msg, reply);
+      const feedbackWrap = document.createElement('div');
+      feedbackWrap.innerHTML = renderChatFeedbackBar(feedbackId);
+      loadingEl.appendChild(feedbackWrap.firstChild);
     }
     const cleanReply = reply.replace(/["']?\s*(?:target|rel|class)=["'][^>]*>(?:\s*↗[^\n↗]*)*/gi, '').replace(/<[^>]*>/g, '');
     chatHistory.push({ role: 'ai', text: cleanReply });
@@ -4797,7 +5327,7 @@ async function sendChat() {
 
 async function callGeminiChat(userMsg) {
   const artistContext = ARTISTS.map(a =>
-    `${a.name} (${a.genre}, ${SECTION_LABELS[a.group]}): ${a.about} Sound: ${a.sound}. Moods: ${a.moods.join(', ')}. Key tracks: ${a.tracks.slice(0,2).join(', ')}.`
+    `${a.name} (${a.genre}, ${SECTION_LABELS[a.group]}): ${a.about} Sound: ${a.sound}. Moods: ${a.moods.join(', ')}. Key tracks: ${a.tracks.join(', ')}.`
   ).join('\n');
 
   const systemPrompt = `You are the voice behind The Soft Wave — a real person who loves R&B, soul, and neo-soul. Not a bot. Not an assistant. A friend who has heard everything and actually cares.
@@ -4816,7 +5346,7 @@ Personality rules — do NOT break these:
 - Every time you mention a song or recommend a track, ALWAYS include both a Spotify and Apple Music search link directly after it. Format them on the same line after the track name. Spotify: https://open.spotify.com/search/ARTIST%20TRACK — Apple Music: https://music.apple.com/search?term=ARTIST%20TRACK (replace spaces with %20 in both). Example: Frank Ocean — Ivy https://open.spotify.com/search/Frank%20Ocean%20Ivy https://music.apple.com/search?term=Frank%20Ocean%20Ivy. Do this for EVERY song mentioned, every time, no exceptions. Never say you can't provide links. IMPORTANT: output ONLY the raw URLs as plain text — do NOT wrap them in any HTML tags like &lt;a href&gt;. No HTML whatsoever.
 
 Artist roster:
-${artistContext}
+${artistContext}${buildLearnedPatternPrompt()}
 
 Music rules:
 - If someone asks for a playlist of N songs, give exactly N tracks — no matter how large. Never cut it short.
@@ -4826,7 +5356,18 @@ Music rules:
 - Mix known anchors with deeper cuts when possible, as long as mood fit stays strong.
 - If you don't know enough about something, say so honestly
 - If someone's message is vague — just "sad", "chill vibes", "something good" — do NOT flood them with recs. Ask ONE specific follow-up to get more texture before recommending. Something like "what kind of sad? numb and hollow, or full-on crying in the car?" or "what's the setting — late night alone, daytime, driving?"
-- The more specific a person's description, the more precise your picks should be. Match the texture of what they give you.${lastGeneratedPlaylist ? `
+- The more specific a person's description, the more precise your picks should be. Match the texture of what they give you.
+- Treat this emotional state as a first-class intent when detected: "I found closure, I am at peace, I am open if they return, it doesn't hurt anymore." This should map to healing + romantic + introspective recommendations (acceptance, grace, soft openness), not heartbreak or despair.
+- If the user expresses closure with openness, explicitly reflect that back in one short sentence before listing songs.
+
+Recommendation formatting rules (strict):
+- When recommending songs, use this exact structure per line: "1. Artist Name - Track Title | one-sentence reason".
+- Use correct spelling and exact artist/track pairing. Be intentional and do not invent tracks.
+- After each recommended line, include both raw links on their own line in this order: Spotify URL then Apple Music URL.
+- Spotify link format: https://open.spotify.com/search/artist:%22ARTIST%22%20track:%22TRACK%22
+- Apple Music link format: https://music.apple.com/search?term=ARTIST%20TRACK
+- Never use HTML tags in the response.
+- If you are unsure about a track, pick a safer known track instead of guessing.${lastGeneratedPlaylist ? `
 
 User's active playlist (use this as a reference point):
 Title: "${lastGeneratedPlaylist.title}" · Mood: "${lastGeneratedPlaylist.mood}"
