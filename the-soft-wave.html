@@ -1444,6 +1444,7 @@
     <div class="logo">The Soft Wave <span>·</span></div>
   </div>
   <div class="header-actions">
+    <span id="adminRoleBadge" style="display:none;font-size:0.5rem;color:var(--gold);font-family:'DM Mono',monospace;letter-spacing:0.1em;text-transform:uppercase;border:1px solid rgba(201,169,127,0.35);padding:0.22rem 0.5rem;border-radius:2px;">Admin</span>
     <button class="select-mode-toggle" id="selectModeToggle" onclick="toggleSelectMode()" title="Select artists">Select</button>
     <button class="btn btn-gold" onclick="openPlaylistModal()">
       <span>Generate Playlist</span>
@@ -2266,6 +2267,8 @@ let qualityFlushTimerId = null;
 function updateAdminOnlyUI() {
   const learnedBtn = document.getElementById('chatLearnedBtn');
   if (learnedBtn) learnedBtn.style.display = currentUserIsAdmin ? 'inline-block' : 'none';
+  const badge = document.getElementById('adminRoleBadge');
+  if (badge) badge.style.display = currentUserIsAdmin ? 'inline-block' : 'none';
 }
 
 async function refreshAdminStatus(session) {
@@ -2300,6 +2303,8 @@ async function refreshAdminStatus(session) {
     // Keep non-admin by default on failures.
   }
   updateAdminOnlyUI();
+  // Re-render so admin-only controls that are rendered into cards become visible.
+  renderGrid();
 }
 
 function loadMismatchReportState() {
