@@ -4988,7 +4988,7 @@ function renderAiTracks(tracks, containerId, withArtistLink = false) {
         type="checkbox" 
         class="track-checkbox" 
         id="${trackId}"
-        onchange="trackSelection.toggleTrack('${trackId}', '${t.artist.replace(/'/g, "\\'")}', '${t.track.replace(/'/g, "\\'")}')"
+        onchange="CuratorAI.trackSelection.toggleTrack('${trackId}', '${t.artist.replace(/'/g, "\\'")}', '${t.track.replace(/'/g, "\\'")}')"
       >
       <div class="ai-track-card fade-in with-checkbox" style="animation-delay:${i*0.07}s">
         <div class="ai-track-artist">${artistDisplay}</div>
