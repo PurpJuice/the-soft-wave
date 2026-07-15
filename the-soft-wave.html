@@ -4377,17 +4377,32 @@ function renderPlaylistOutput(data, mood) {
       ? `<span style="cursor:pointer;color:var(--gold);text-decoration:underline;text-underline-offset:3px;" onclick="closePlaylistOutput();openDetail('${artistObj.id}')">${t.artist}</span>`
       : `<span style="color:var(--gold)">${t.artist}</span>`;
 
+    const trackId = `track-playlist-${i}`;
+    const streamingLinksHtml = window.CuratorAI ? window.CuratorAI.createStreamingLinksHTML(t.artist, t.track) : `
+      <div class="streaming-links">
+        <a href="${spotifyUrl}" target="_blank" class="streaming-link spotify-link" title="Open on Spotify">Spotify</a>
+        <a href="${appleMusicUrl}" target="_blank" class="streaming-link apple-link" title="Open on Apple Music">Apple Music</a>
+      </div>`;
+    
     return `<div class="ai-track-card fade-in" style="animation-delay:${i * 0.05}s">
-      <div class="ai-track-artist">${artistLink}</div>
-      <div class="ai-track-name">${t.track}</div>
-      <div class="ai-track-reason">${t.reason}</div>
-      <div class="ai-track-links">
-        <a href="${spotifyUrl}" target="_blank" class="ai-track-link rec-track-link" data-source="playlist_output" data-artist="${t.artist.replace(/"/g,'&quot;')}" data-track="${t.track.replace(/"/g,'&quot;')}" title="Strict artist+track search">↗ Spotify</a>
-        <a href="${appleMusicUrl}" class="ai-track-link rec-track-link" data-source="playlist_output" data-artist="${t.artist.replace(/"/g,'&quot;')}" data-track="${t.track.replace(/"/g,'&quot;')}" title="Strict artist+track search">↗ Apple Music</a>
+      <div style="display:flex;align-items:flex-start;gap:0.75rem;">
+        <input 
+          type="checkbox" 
+          class="track-checkbox" 
+          id="${trackId}"
+          onchange="CuratorAI.trackSelection.toggleTrack('${trackId}', '${t.artist.replace(/'/g, "\\'")}', '${t.track.replace(/'/g, "\\'")}')"
+          style="margin-top:0.15rem;flex-shrink:0;"
+        >
+        <div style="flex:1;">
+          <div class="ai-track-artist">${artistLink}</div>
+          <div class="ai-track-name">${t.track}</div>
+          <div class="ai-track-reason">${t.reason}</div>
+          ${streamingLinksHtml}
+          ${verifyNote}
+          ${mismatchBtn ? `<div style="margin-top:0.2rem;">${mismatchBtn}</div>` : ''}
+          ${renderTrackRatingWidget(t.artist, t.track, 'playlist_output')}
+        </div>
       </div>
-      ${verifyNote}
-      ${mismatchBtn ? `<div style="margin-top:0.2rem;">${mismatchBtn}</div>` : ''}
-      ${renderTrackRatingWidget(t.artist, t.track, 'playlist_output')}
     </div>`;
   }).join('');
 
