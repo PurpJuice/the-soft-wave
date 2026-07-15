@@ -337,6 +337,10 @@ class TrackSelectionManager {
    */
   clear() {
     this.selectedTracks.clear();
+    // Also uncheck all checkboxes in the DOM
+    document.querySelectorAll('.track-checkbox').forEach(cb => {
+      cb.checked = false;
+    });
     this.notifyUpdate();
   }
 
