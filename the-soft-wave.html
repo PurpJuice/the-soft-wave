@@ -8,6 +8,8 @@
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,300;0,400;0,500;0,600;1,300;1,400;1,500&family=DM+Mono:ital,wght@0,300;0,400;0,500;1,300;1,400&display=swap" rel="stylesheet">
 <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<link rel="stylesheet" href="curator-ui-styles.css">
+<script defer src="curator-ai-system.js"></script>
 <style>
   :root {
     --bg: #080809;
@@ -1378,6 +1380,13 @@
 </head>
 <body>
 
+<!-- AMBIENT WAVES BACKGROUND -->
+<div id="ambientWavesContainer">
+  <div class="wave"></div>
+  <div class="wave"></div>
+  <div class="wave"></div>
+</div>
+
 <!-- AUTH OVERLAY -->
 <div id="authOverlay" style="position:fixed;inset:0;background:var(--bg);z-index:9999;display:flex;align-items:center;justify-content:center;padding:1.5rem;">
   <div style="width:100%;max-width:380px;">
@@ -1634,10 +1643,25 @@
 
 <!-- SELECTION BAR -->
 <div class="select-bar" id="selectBar">
-  <span style="font-size:0.6rem;color:var(--muted);letter-spacing:0.08em;"><span id="selectCount">0</span> selected</span>
-  <button class="btn btn-gold" onclick="selectionToPlaylist()">Generate Playlist</button>
-  <button class="btn" onclick="selectionToChat()">Ask Chat</button>
-  <button class="btn" onclick="clearSelection()" style="color:var(--muted);">Clear</button>
+  <span style="font-size:0.6rem;color:var(--muted);letter-spacing:0.08em;">
+    <span id="selectCount">0</span> selected
+  </span>
+  <button class="btn" onclick="CuratorAI.searchSelectedOnYouTube()" title="Search selected tracks on YouTube">
+    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+      <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
+    </svg>
+    YouTube
+  </button>
+  <button class="btn btn-gold" onclick="CuratorAI.copySelectedTracks()" title="Copy selected tracks to clipboard">
+    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+      <path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"/>
+      <path d="M9 2h6a2 2 0 0 1 2 2v0a2 2 0 0 1-2 2H9a2 2 0 0 1-2-2v0a2 2 0 0 1 2-2z"/>
+    </svg>
+    Copy
+  </button>
+  <button class="btn" onclick="trackSelection.clear()" style="color:var(--muted);" title="Clear selection">
+    Clear
+  </button>
 </div>
 
 <script>
@@ -4945,6 +4969,7 @@ function renderAiTracks(tracks, containerId, withArtistLink = false) {
   const safeTracks = sanitizeAiTrackList(tracks || []);
 
   container.innerHTML = `<div class="ai-results">` + safeTracks.map((t, i) => {
+    const trackId = `track-${containerId}-${i}`;
     const links = trackSearchLinks(t.artist, t.track);
     const spotifyUrl = links.spotifyUrl;
     const appleMusicUrl = links.appleUrl;
@@ -4955,20 +4980,41 @@ function renderAiTracks(tracks, containerId, withArtistLink = false) {
       ? `<span style="cursor:pointer;text-decoration:underline;text-underline-offset:3px;" onclick="openDetail('${artistObj.id}')">${t.artist}</span>`
       : t.artist;
 
-    return `<div class="ai-track-card fade-in" style="animation-delay:${i*0.07}s">
-      <div class="ai-track-artist">${artistDisplay}</div>
-      <div class="ai-track-name">${t.track}</div>
-      <div class="ai-track-reason">${t.reason}</div>
-      <div class="ai-track-links">
-        <a href="${spotifyUrl}" target="_blank" class="ai-track-link rec-track-link" data-source="${containerId}" data-artist="${t.artist.replace(/"/g,'&quot;')}" data-track="${t.track.replace(/"/g,'&quot;')}" title="Strict artist+track search">↗ Spotify</a>
-        <a href="${appleMusicUrl}" class="ai-track-link rec-track-link" data-source="${containerId}" data-artist="${t.artist.replace(/"/g,'&quot;')}" data-track="${t.track.replace(/"/g,'&quot;')}" title="Strict artist+track search">↗ Apple Music</a>
+    // Create streaming links using curator system
+    const streamingLinksHTML = CuratorAI.createStreamingLinksHTML(t.artist, t.track);
+
+    return `<div class="ai-track-card-wrapper">
+      <input 
+        type="checkbox" 
+        class="track-checkbox" 
+        id="${trackId}"
+        onchange="trackSelection.toggleTrack('${trackId}', '${t.artist.replace(/'/g, "\\'")}', '${t.track.replace(/'/g, "\\'")}')"
+      >
+      <div class="ai-track-card fade-in with-checkbox" style="animation-delay:${i*0.07}s">
+        <div class="ai-track-artist">${artistDisplay}</div>
+        <div class="ai-track-name">${t.track}</div>
+        <div class="ai-track-reason">${t.reason}</div>
+        <div style="display:flex;gap:0.75rem;align-items:center;margin-top:0.5rem;">
+          <div class="ai-track-links" style="flex:1;">
+            <a href="${spotifyUrl}" target="_blank" class="ai-track-link rec-track-link" data-source="${containerId}" data-artist="${t.artist.replace(/"/g,'&quot;')}" data-track="${t.track.replace(/"/g,'&quot;')}" title="Strict artist+track search">↗ Spotify</a>
+            <a href="${appleMusicUrl}" class="ai-track-link rec-track-link" data-source="${containerId}" data-artist="${t.artist.replace(/"/g,'&quot;')}" data-track="${t.track.replace(/"/g,'&quot;')}" title="Strict artist+track search">↗ Apple Music</a>
+          </div>
+          ${streamingLinksHTML}
+        </div>
+        ${verifyNote}
+        ${mismatchBtn ? `<div style="margin-top:0.2rem;">${mismatchBtn}</div>` : ''}
+        ${renderTrackRatingWidget(t.artist, t.track, containerId)}
       </div>
-      ${verifyNote}
-      ${mismatchBtn ? `<div style="margin-top:0.2rem;">${mismatchBtn}</div>` : ''}
-      ${renderTrackRatingWidget(t.artist, t.track, containerId)}
     </div>`;
   }).join('') + `</div>`;
 }
+
+/**
+ * Hook selection tracking callback to update UI
+ */
+CuratorAI.trackSelection.onUpdate((count, tracks) => {
+  updateSelectionBar(count, tracks);
+});
 
 // ============================================================
 // CHAT
@@ -6093,6 +6139,59 @@ updateAdminOnlyUI();
 
 // Close the mainApp wrapper
 document.getElementById('mainApp').insertAdjacentHTML('beforeend', '');
+
+// ============================================================
+// INITIALIZATION: Setup Curator AI System
+// ============================================================
+
+/**
+ * Initialize all Curator AI features when page loads and curator system is ready
+ */
+function initCuratorSystem() {
+  // Wait for curator system to be available
+  if (typeof CuratorAI === 'undefined') {
+    console.warn('Curator AI not yet loaded, will retry...');
+    setTimeout(initCuratorSystem, 100);
+    return;
+  }
+
+  console.log('✓ Initializing Curator AI System');
+
+  // Initialize ambient waves background
+  CuratorAI.initAmbientWaves();
+
+  // Setup selection tracking callback to update bottom bar UI
+  CuratorAI.trackSelection.onUpdate((count, tracks) => {
+    const selectBar = document.getElementById('selectBar');
+    const selectCount = document.getElementById('selectCount');
+    if (!selectBar) return;
+
+    selectCount.textContent = count;
+
+    if (count > 0) {
+      selectBar.classList.add('visible');
+    } else {
+      selectBar.classList.remove('visible');
+    }
+  });
+
+  console.log('✓ Curator UI ready: ambient waves, selection tracking active');
+}
+
+// Start initialization after a brief delay to ensure DOM is ready
+document.addEventListener('DOMContentLoaded', () => {
+  // Small delay to let curator-ai-system.js load
+  setTimeout(initCuratorSystem, 200);
+});
+
+// Also try immediate initialization (in case DOMContentLoaded already fired)
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', () => {
+    setTimeout(initCuratorSystem, 200);
+  });
+} else {
+  setTimeout(initCuratorSystem, 200);
+}
 
 </script>
 </body>
