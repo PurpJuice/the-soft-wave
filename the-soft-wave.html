@@ -5009,13 +5009,6 @@ function renderAiTracks(tracks, containerId, withArtistLink = false) {
   }).join('') + `</div>`;
 }
 
-/**
- * Hook selection tracking callback to update UI
- */
-CuratorAI.trackSelection.onUpdate((count, tracks) => {
-  updateSelectionBar(count, tracks);
-});
-
 // ============================================================
 // CHAT
 // ============================================================
