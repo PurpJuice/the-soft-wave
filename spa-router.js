@@ -72,7 +72,7 @@ class SoftWaveRouter {
    * Ensure all page container divs exist in the DOM
    */
   ensurePageContainers() {
-    const mainContent = document.querySelector('main') || document.querySelector('[role="main"]');
+    const mainContent = document.querySelector('main') || document.querySelector('[role="main"]') || document.getElementById('mainContent');
     
     if (!mainContent) {
       console.warn('No main content area found. Router may not function correctly.');
